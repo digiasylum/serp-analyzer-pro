@@ -63,6 +63,89 @@ Scan competitor pages for external domains that may represent link-building oppo
 - Founders and growth teams
 - Anyone planning search-focused content
 
+## Installation
+
+Follow these steps to run SERP V7 locally in VS Code.
+
+### 1. Download or Clone the Project
+
+Download this repository to your computer, or clone it from GitHub. Open the project folder in VS Code.
+
+### 2. Open the VS Code Terminal
+
+In VS Code, open the terminal from:
+
+Terminal > New Terminal
+
+Make sure the terminal is opened inside the SERP V7 project folder.
+
+### 3. Create a Virtual Environment
+
+For Windows:
+
+```bash
+python -m venv venv
+```
+
+For macOS or Linux:
+
+```bash
+python3 -m venv venv
+```
+
+### 4. Activate the Virtual Environment
+
+For Windows PowerShell:
+
+```bash
+venv\Scripts\Activate.ps1
+```
+
+For Windows Command Prompt:
+
+```bash
+venv\Scripts\activate.bat
+```
+
+For macOS or Linux:
+
+```bash
+source venv/bin/activate
+```
+
+### 5. Install Required Packages
+
+```bash
+pip install -r requirements.txt
+```
+
+### 6. Run the App Locally
+
+```bash
+streamlit run app.py
+```
+
+After running the command, Streamlit will open the app in your browser. If it does not open automatically, visit:
+
+```text
+http://localhost:8501
+```
+
+## SerpAPI Key
+
+SERP V7 requires a SerpAPI key to fetch live Google SERP results.
+
+Create a free SerpAPI account here:
+
+https://serpapi.com/users/sign_up
+
+After signing up, copy your private API key from your SerpAPI dashboard/account area and paste it into the app sidebar under `SerpAPI Key`, then click `Authenticate`.
+
+You can also learn more about SerpAPI here:
+
+https://serpapi.com/
+
+
 ## Data Source
 
 SERP V7 uses SerpAPI for live Google SERP data and combines it with webpage scraping and content analysis to generate insights. A SerpAPI key is required to fetch live search results.
