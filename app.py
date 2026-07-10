@@ -17,15 +17,16 @@
 from __future__ import annotations
 
 import html as html_lib
-import re
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
+import ai_seo
 import content_grader
 import serp_analyzer
 import url_inspector
+from gemini_client import validate_gemini_key, DEFAULT_MODEL as GEMINI_DEFAULT_MODEL
 from utils import domain_of, normalize_url, slugify, validate_and_get_serpapi_quota
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -256,14 +257,6 @@ def ibadge(intent: str) -> str:
     return f'<span class="ibadge {cls_map.get(intent, "ib-info")}">{html_lib.escape(intent)}</span>'
 
 
-def parse_keywords_input(raw: str) -> list[str]:
-    """Parse comma/newline-separated keyword input into a clean list."""
-    if not raw:
-        return []
-    values = re.split(r"[\n,]+", raw)
-    return [v.strip() for v in values if v.strip()]
-
-
 def render_content_blocks(blocks: list) -> None:
     """Render heading/paragraph/list blocks from url_inspector into Streamlit."""
     for block in blocks:
@@ -332,7 +325,7 @@ def generate_schema_table(schema_data: dict | list) -> str:
             )
         else:
             display = html_lib.escape(vs)
-        out += f"<tr><td>{key}</td><td>{display}</td></tr>"
+        out += f"<tr><td>{html_lib.escape(str(key))}</td><td>{display}</td></tr>"
     return out + "</table>"
 
 
@@ -343,7 +336,7 @@ def slabel(text: str) -> None:
 
 # ── Caching ───────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=3_600, show_spinner=False)
+@st.cache_data(ttl=1_800, show_spinner=False)
 def cached_fetch_serp(api_key: str, query: str, gl: str, hl: str, num: int) -> dict:
     """Cache SERP API responses for 1 hour to avoid burning credits on rerenders."""
     return serp_analyzer.fetch_serp(api_key, query, gl, hl, num)
@@ -360,14 +353,20 @@ _DEFAULTS: dict = {
     "api_ok":                   False,
     "api_key":                  "",
     "quota_info":               None,
+    "gemini_ok":                False,
+    "gemini_key":               "",
+    "use_ai":                   True,
+    "ai_content_brief":         None,
+    "recovery_plan":            None,
+    "improvement_plan":         None,
+    "_last_tracker_serp":       None,
     "brief_data":               None,
     "serp_data":                None,
-    "serp_fetch_meta":          None,
     "inspection_data":          None,
     "grading_results":          None,
     "comparison_result":        None,
     "position_tracker":         None,
-    "position_tracker_history": [],
+    "position_tracker_history": [], "batch_tracking_results": [], "batch_tracking_running": False,
     "local_pack_query":         "",
     "local_pack_results":       [],
 }
@@ -406,6 +405,35 @@ with st.sidebar:
             f'</div>',
             unsafe_allow_html=True,
         )
+
+    st.markdown("---")
+    st.markdown("### 🤖 AI Analysis (Gemini)")
+    _gemini_input = st.text_input(
+        "Gemini API Key", type="password", placeholder="Paste your Gemini API key here…",
+        help="Powers dynamic Intent Detection, Query Fan-out, Content Brief, and Topical Authority. Optional — the tool falls back to formula-based analysis without it.",
+    )
+    if st.button("Connect Gemini →", use_container_width=True):
+        with st.spinner("Validating…"):
+            _gresult = validate_gemini_key(_gemini_input)
+            if _gresult["ok"]:
+                st.session_state.gemini_ok  = True
+                st.session_state.gemini_key = _gemini_input
+                st.success(_gresult["message"])
+            else:
+                st.session_state.gemini_ok = False
+                st.error(_gresult["message"])
+
+    if st.session_state.gemini_ok:
+        st.markdown(
+            '<div style="background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.25);'
+            'border-radius:10px;padding:10px 14px;margin:8px 0;font-size:.78rem;">'
+            '✓ AI-powered analysis active</div>',
+            unsafe_allow_html=True,
+        )
+        st.session_state.use_ai = st.toggle("Use AI for this analysis", value=st.session_state.use_ai,
+            help="Turn off to force formula-based analysis even with a connected key (useful to save Gemini quota).")
+    else:
+        st.caption("Without a Gemini key, SERP V7 still works fully on formula-based analysis.")
 
     st.markdown("---")
     st.markdown("### ⚙️ Search Settings")
@@ -480,33 +508,52 @@ with tab1:
         st.markdown("</div>", unsafe_allow_html=True)
 
     if go_btn and query:
-        with st.spinner(f"Fetching top {num} results and scraping concurrently…"):
-            raw = cached_fetch_serp(st.session_state.api_key, query, gl, hl, num)
+        _use_ai = st.session_state.gemini_ok and st.session_state.use_ai
+        _gkey   = st.session_state.gemini_key if _use_ai else ""
+        try:
+            with st.spinner(f"Fetching top {num} results and scraping concurrently…"):
+                raw = cached_fetch_serp(st.session_state.api_key, query, gl, hl, num)
             if not raw or "organic_results" not in raw:
                 st.error("❌ Failed to fetch SERP. Check your API key and remaining quota.")
             else:
-                intent         = serp_analyzer.detect_intent(query, raw)
-                rk             = serp_analyzer.extract_related_keywords(st.session_state.api_key, query, raw)
-                content_result = serp_analyzer.analyze_serp_content(raw.get("organic_results", []))
-                _ta_input      = {"query": query, "intent": intent, "related_keywords": rk, **content_result}
+                with st.spinner("Analyzing intent, keywords, and competitor content…"):
+                    rk             = serp_analyzer.extract_related_keywords(st.session_state.api_key, query, raw)
+                    content_result = serp_analyzer.analyze_serp_content(raw.get("organic_results", []))
+                    intent, audience_profile, intent_meta = ai_seo.get_intent_analysis(query, raw, _gkey)
+
+                spinner_msg = "Generating AI-grounded fan-out & topical plan…" if _use_ai else "Generating fan-out & topical plan…"
+                with st.spinner(spinner_msg):
+                    fanout = ai_seo.get_query_fanout(query, rk, raw, content_result, _gkey)
+                    _ta_input = {"query": query, "intent": intent, "related_keywords": rk, **content_result}
+                    topical_authority = ai_seo.get_topical_authority(_ta_input, _gkey)
+
                 bd: dict = {
                     "query":            query,
                     "intent":           intent,
-                    "audience_profile": serp_analyzer.get_audience_profile(intent),
+                    "intent_meta":      intent_meta,
+                    "audience_profile": audience_profile,
                     "ai_overview":      serp_analyzer.build_ai_overview(raw, st.session_state.api_key),
                     "related_keywords": rk,
                     "serp_features":    serp_analyzer.extract_serp_features(raw),
-                    "fanout":           serp_analyzer.generate_query_fanout(query, rk, raw),
-                    "topical_authority":serp_analyzer.generate_topical_authority(_ta_input),
+                    "fanout":           fanout,
+                    "topical_authority":topical_authority,
                     "local_pack":       serp_analyzer.extract_local_pack(raw),
                     **content_result,
                 }
+                _question_pool = (
+                    rk.get("people_also_ask", []) + rk.get("related_searches", []) + rk.get("autocomplete", [])
+                    + [a.get("question", "") if isinstance(a, dict) else a for a in fanout.get("ai_angles", [])]
+                    + [q for cluster_qs in fanout.get("intent_clusters", {}).values() for q in cluster_qs]
+                )
+                bd["question_explorer"] = serp_analyzer.classify_questions_by_type(_question_pool)
                 bd["markdown_brief"] = serp_analyzer.generate_v1_style_markdown_brief(bd)
                 st.session_state.brief_data      = bd
                 st.session_state.serp_data       = raw
-                st.session_state.serp_fetch_meta = {"query": query, "gl": gl, "hl": hl, "num": num}
                 st.session_state.comparison_result = None  # reset stale comparison
-                st.success(f"✅ Analysis complete — {len(raw.get('organic_results', []))} results processed.")
+                _ai_note = " (AI-powered)" if intent_meta.get("source") == "ai" else ""
+                st.success(f"✅ Analysis complete{_ai_note} — {len(raw.get('organic_results', []))} results processed.")
+        except Exception as e:
+            st.error(f"❌ Something went wrong during analysis: {e}. Please try again — if it persists, try a lower result count or check your API keys.")
 
     if st.session_state.brief_data:
         data = st.session_state.brief_data
@@ -516,11 +563,20 @@ with tab1:
             st.markdown('<div class="v7-card">', unsafe_allow_html=True)
             slabel("Content Strategy")
             ap = data["audience_profile"]
+            im = data.get("intent_meta", {})
+            _src_pill = (
+                '<span style="background:rgba(59,91,219,.15);color:var(--primary-color,#3b5bdb);border-radius:8px;'
+                f'padding:2px 9px;font-size:.68rem;font-weight:600;">🤖 AI · {im.get("confidence","?")}% confidence</span>'
+                if im.get("source") == "ai" else
+                '<span style="background:rgba(148,163,184,.12);border-radius:8px;padding:2px 9px;'
+                'font-size:.68rem;opacity:.55;">📐 Formula-based</span>'
+            )
             st.markdown(
-                f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">'
+                f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;">'
                 f'<span style="font-size:.82rem;opacity:.45;">Search Intent:</span>'
                 f'{ibadge(data["intent"])}'
                 f'<span style="font-size:.75rem;opacity:.35;">· {html_lib.escape(ap["stage"])}</span>'
+                f'{_src_pill}'
                 f'</div>',
                 unsafe_allow_html=True,
             )
@@ -532,6 +588,8 @@ with tab1:
                 f'</div>',
                 unsafe_allow_html=True,
             )
+            if im.get("source") == "ai" and im.get("reasoning"):
+                st.caption(f"🧠 {im['reasoning']}")
             st.markdown("</div>", unsafe_allow_html=True)
 
         # SERP Features + AI Overview
@@ -607,13 +665,27 @@ with tab1:
         if fo:
             with st.container():
                 st.markdown('<div class="v7-card">', unsafe_allow_html=True)
-                slabel("Query Fan-out & LLM / AI Optimization")
+                _fo_src = fo.get("meta", {}).get("source", "formula")
+                _fo_badge = (
+                    ' <span style="background:rgba(59,91,219,.15);color:var(--primary-color,#3b5bdb);border-radius:8px;'
+                    'padding:2px 9px;font-size:.68rem;font-weight:600;vertical-align:middle;">🤖 Gemini-grounded</span>'
+                    if _fo_src == "ai" else
+                    ' <span style="background:rgba(148,163,184,.12);border-radius:8px;padding:2px 9px;'
+                    'font-size:.68rem;opacity:.55;vertical-align:middle;">📐 Formula-based</span>'
+                )
+                st.markdown(f'<span class="slabel" style="display:inline;">Query Fan-out & LLM / AI Optimization</span>{_fo_badge}', unsafe_allow_html=True)
                 st.markdown(
-                    '<div style="font-size:.83rem;opacity:.65;line-height:1.75;margin-bottom:16px;">'
+                    '<div style="font-size:.83rem;opacity:.65;line-height:1.75;margin:10px 0 16px;">'
                     'Google, ChatGPT, Gemini and Perplexity <strong>fan out</strong> your keyword into '
                     'dozens of sub-queries. Cover every cluster below to appear in AI Overviews and LLM answers.'
                     '</div>', unsafe_allow_html=True)
-                ft1, ft2, ft3 = st.tabs(["🎯 Intent Clusters", "🧠 AI Angles", "🗺️ Content Cluster Map"])
+                fo_tab_labels = ["🎯 Intent Clusters", "🧠 AI Angles", "🗺️ Content Cluster Map"]
+                has_gaps = bool(fo.get("entities") or fo.get("content_gaps"))
+                if has_gaps:
+                    fo_tab_labels.append("🔍 Entities & Gaps")
+                    ft1, ft2, ft3, ft4 = st.tabs(fo_tab_labels)
+                else:
+                    ft1, ft2, ft3 = st.tabs(fo_tab_labels)
                 BADGE_CLS = ["ib-info", "ib-comm", "ib-trans", "ib-nav"]
                 with ft1:
                     fc1, fc2 = st.columns(2)
@@ -628,13 +700,22 @@ with tab1:
                 with ft2:
                     st.markdown('<div style="font-size:.78rem;opacity:.45;margin-bottom:12px;">Address each question pattern in your article to appear in AI-generated answers.</div>', unsafe_allow_html=True)
                     for i, angle in enumerate(fo["ai_angles"]):
+                        _q     = angle.get("question", "") if isinstance(angle, dict) else angle
+                        _title = angle.get("currently_cited_title", "") if isinstance(angle, dict) else ""
+                        _url   = angle.get("currently_cited_url", "") if isinstance(angle, dict) else ""
+                        _cite_html = (
+                            f'<div style="font-size:.72rem;opacity:.55;margin-top:3px;">'
+                            f'📎 Currently cited: <a href="{html_lib.escape(_url)}" target="_blank">{html_lib.escape(_title)}</a></div>'
+                            if _title and _url else
+                            '<div style="font-size:.72rem;opacity:.35;margin-top:3px;">No current citation found — open opportunity</div>'
+                        )
                         st.markdown(
                             f'<div style="display:flex;gap:10px;align-items:flex-start;padding:8px 0;'
                             f'border-bottom:1px solid rgba(148,163,184,.08);">'
                             f'<span style="background:rgba(59,91,219,.18);color:var(--primary-color,#3b5bdb);'
                             f'border-radius:50%;width:22px;height:22px;display:flex;align-items:center;'
                             f'justify-content:center;font-size:.7rem;font-weight:700;flex-shrink:0;">{i+1}</span>'
-                            f'<span style="font-size:.84rem;">{html_lib.escape(angle)}</span></div>',
+                            f'<div><span style="font-size:.84rem;">{html_lib.escape(_q)}</span>{_cite_html}</div></div>',
                             unsafe_allow_html=True)
                 with ft3:
                     for cluster_type, pages in fo["content_clusters"].items():
@@ -649,12 +730,68 @@ with tab1:
                             f'<div class="chip-wrap">'
                             + "".join(f'<span class="chip">{html_lib.escape(p)}</span>' for p in pages if p)
                             + "</div></div>", unsafe_allow_html=True)
+                if has_gaps:
+                    with ft4:
+                        if fo.get("entities"):
+                            st.markdown("**Key Entities to Cover** — recurring concepts across top-ranking pages", unsafe_allow_html=False)
+                            st.markdown(chips(fo["entities"], "chip"), unsafe_allow_html=True)
+                        if fo.get("content_gaps"):
+                            st.markdown("**Content Gaps** — subtopics competitors under-serve", unsafe_allow_html=False)
+                            for gap in fo["content_gaps"]:
+                                st.markdown(
+                                    f'<div style="display:flex;gap:8px;align-items:flex-start;padding:6px 0;'
+                                    f'border-bottom:1px solid rgba(148,163,184,.08);font-size:.84rem;">'
+                                    f'<span style="opacity:.4;">→</span><span>{html_lib.escape(gap)}</span></div>',
+                                    unsafe_allow_html=True,
+                                )
                 fo_df = pd.DataFrame(
                     [{"Type": cn, "Query": q} for cn, qs in fo["intent_clusters"].items() for q in qs]
-                    + [{"Type": "AI Angle", "Query": a} for a in fo["ai_angles"]]
+                    + [{"Type": "AI Angle",
+                        "Query": (a.get("question","") if isinstance(a, dict) else a),
+                        "Currently Cited": (a.get("currently_cited_title","") if isinstance(a, dict) else "")}
+                       for a in fo["ai_angles"]]
                 )
                 st.download_button("⬇️ Download Fan-out CSV",
                     fo_df.to_csv(index=False).encode(), f"{slugify(query)}-fanout.csv", "text/csv")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+        # Question Explorer — Answer-the-Public style breakdown of every real
+        # question collected (PAA + related + autocomplete + AI fan-out), grouped
+        # by question type so a writer sees intent distribution at a glance.
+        qe = data.get("question_explorer")
+        if qe and qe.get("buckets"):
+            with st.container():
+                st.markdown('<div class="v7-card">', unsafe_allow_html=True)
+                slabel(f"❓ Question Explorer — {qe['total_questions']} Real Questions by Type")
+                st.markdown(
+                    '<div style="font-size:.78rem;opacity:.45;margin-bottom:14px;">'
+                    'Every real question pulled from PAA, related searches, autocomplete, and the fan-out above — '
+                    'grouped Answer-the-Public style so you can see at a glance which question types dominate demand.</div>',
+                    unsafe_allow_html=True,
+                )
+                qe_cols = st.columns(3)
+                for i, (bucket_name, questions) in enumerate(qe["buckets"].items()):
+                    with qe_cols[i % 3]:
+                        st.markdown(
+                            f'<div style="background:var(--secondary-background-color);border:1px solid rgba(148,163,184,.12);'
+                            f'border-radius:10px;padding:12px 14px;margin-bottom:10px;">'
+                            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+                            f'<strong style="font-size:.82rem;">{html_lib.escape(bucket_name)}</strong>'
+                            f'<span style="font-size:.68rem;opacity:.5;background:rgba(59,91,219,.12);'
+                            f'padding:1px 7px;border-radius:6px;">{len(questions)}</span></div>'
+                            + "".join(
+                                f'<div style="font-size:.78rem;opacity:.7;padding:3px 0;border-top:1px solid rgba(148,163,184,.06);">{html_lib.escape(q)}</div>'
+                                for q in questions[:6]
+                              )
+                            + (f'<div style="font-size:.72rem;opacity:.4;padding-top:4px;">+{len(questions)-6} more</div>' if len(questions) > 6 else "")
+                            + "</div>",
+                            unsafe_allow_html=True,
+                        )
+                qe_df = pd.DataFrame(
+                    [{"Type": bt, "Question": q} for bt, qs in qe["buckets"].items() for q in qs]
+                )
+                st.download_button("⬇️ Download Question Explorer CSV",
+                    qe_df.to_csv(index=False).encode(), f"{slugify(query)}-question-explorer.csv", "text/csv")
                 st.markdown("</div>", unsafe_allow_html=True)
 
         # Keyword Opportunities
@@ -710,7 +847,15 @@ with tab2:
         # Snapshot metrics
         with st.container():
             st.markdown('<div class="v7-card">', unsafe_allow_html=True)
-            slabel("Topical Authority Snapshot")
+            _ta_src = ta.get("meta", {}).get("source", "formula")
+            _ta_badge = (
+                '<span style="background:rgba(59,91,219,.15);color:var(--primary-color,#3b5bdb);border-radius:8px;'
+                'padding:2px 9px;font-size:.68rem;font-weight:600;">🤖 Gemini-grounded</span>'
+                if _ta_src == "ai" else
+                '<span style="background:rgba(148,163,184,.12);border-radius:8px;padding:2px 9px;'
+                'font-size:.68rem;opacity:.55;">📐 Formula-based</span>'
+            )
+            st.markdown(f'<span class="slabel" style="display:inline;">Topical Authority Snapshot</span> {_ta_badge}', unsafe_allow_html=True)
             auth_score   = ta.get("authority_score", 0)
             auth_color   = score_color(auth_score)
             auth_verdict = "Strong" if auth_score >= 70 else "Developing" if auth_score >= 40 else "Thin"
@@ -1086,8 +1231,7 @@ with tab4:
                                 st.markdown(f'<div class="cb-p">{html_lib.escape(p)}</div>', unsafe_allow_html=True)
                         elif c.get("full_text"):
                             st.text_area("", c["full_text"][:1500], height=280,
-                                         disabled=True, label_visibility="collapsed",
-                                         key=f"comp_full_text_{c.get('position', 0)}_{slugify(c.get('url', ''))}")
+                                         disabled=True, label_visibility="collapsed")
                         else:
                             st.caption("Content not available for this page.")
                         st.markdown("**Readability Feedback**")
@@ -1232,6 +1376,81 @@ with tab5:
                         else:
                             st.dataframe(pd.DataFrame(gd["ngrams"][NG_KEYS[i]], columns=["Phrase (count)"]),
                                          use_container_width=True, height=240)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            # ── AI Content Brief (Gemini-powered, grounded in real competitor pages) ──
+            with st.container():
+                st.markdown('<div class="v7-card">', unsafe_allow_html=True)
+                slabel("🤖 AI Content Brief — What to Write Next")
+                if not st.session_state.gemini_ok:
+                    st.caption("Connect a Gemini API key in the sidebar to unlock a grounded editorial brief here.")
+                elif not _comp_available:
+                    st.caption("💡 Run a SERP analysis in Tab 1 first — the AI brief is grounded in real competitor pages, not generated from thin air.")
+                else:
+                    if st.button("Generate AI Content Brief", key="ai_brief_btn"):
+                        with st.spinner("Reading competitor pages and drafting your brief…"):
+                            bdata = st.session_state.brief_data
+                            brief = ai_seo.get_content_brief(
+                                query=bdata.get("query", ""),
+                                intent=bdata.get("intent", "Informational"),
+                                competitor_scores=bdata.get("competitor_scores", []),
+                                content_result=bdata,
+                                related_kw=bdata.get("related_keywords", {}),
+                                api_key=st.session_state.gemini_key,
+                            )
+                            st.session_state["ai_content_brief"] = brief
+
+                    _brief = st.session_state.get("ai_content_brief")
+                    if _brief:
+                        if not _brief.get("ok"):
+                            st.warning(f"⚠️ Could not generate AI brief ({_brief.get('reason', 'unknown error')}). Try again in a moment.")
+                        else:
+                            st.markdown(
+                                f'<div class="ai-box"><strong>Recommended format:</strong> '
+                                f'{html_lib.escape(_brief.get("content_type_recommendation",""))}<br>'
+                                f'<strong>Target length:</strong> ~{_brief.get("recommended_word_count",0):,} words</div>',
+                                unsafe_allow_html=True)
+
+                            if _brief.get("title_options"):
+                                st.markdown("**Title Options**")
+                                for t in _brief["title_options"]:
+                                    st.markdown(
+                                        f'<div style="font-size:.86rem;padding:6px 12px;background:var(--secondary-background-color);'
+                                        f'border-radius:8px;margin-bottom:5px;">📝 {html_lib.escape(t)}</div>',
+                                        unsafe_allow_html=True)
+
+                            if _brief.get("primary_keyword") or _brief.get("secondary_keywords"):
+                                kc1, kc2 = st.columns([1, 2])
+                                with kc1:
+                                    st.markdown(f"**Primary Keyword**\n\n`{_brief.get('primary_keyword','')}`")
+                                with kc2:
+                                    st.markdown("**Secondary Keywords**")
+                                    st.markdown(chips(_brief.get("secondary_keywords", []), "chip"), unsafe_allow_html=True)
+
+                            bc1, bc2 = st.columns(2)
+                            with bc1:
+                                st.markdown("**Suggested Outline**")
+                                for h in _brief.get("suggested_outline", []):
+                                    st.markdown(f"- {html_lib.escape(h)}", unsafe_allow_html=False)
+                                st.markdown("**Missing Subtopics (competitor gaps)**")
+                                for m in _brief.get("missing_subtopics", []):
+                                    st.markdown(f"- {html_lib.escape(m)}", unsafe_allow_html=False)
+                            with bc2:
+                                st.markdown("**Ways to Differentiate**")
+                                for u in _brief.get("unique_angle_ideas", []):
+                                    st.markdown(f"- {html_lib.escape(u)}", unsafe_allow_html=False)
+                                st.markdown("**FAQs to Answer**")
+                                for f in _brief.get("faqs_to_answer", []):
+                                    st.markdown(f"- {html_lib.escape(f)}", unsafe_allow_html=False)
+
+                            if _brief.get("tone_formality") or _brief.get("tone_point_of_view") or _brief.get("tone_avoid"):
+                                st.markdown("**Tone & Style**")
+                                _tone_bits = []
+                                if _brief.get("tone_formality"): _tone_bits.append(f"**Formality:** {html_lib.escape(_brief['tone_formality'])}")
+                                if _brief.get("tone_point_of_view"): _tone_bits.append(f"**POV:** {html_lib.escape(_brief['tone_point_of_view'])}")
+                                st.markdown(" · ".join(_tone_bits), unsafe_allow_html=True)
+                                if _brief.get("tone_avoid"):
+                                    st.caption("🚫 Avoid: " + ", ".join(_brief["tone_avoid"]))
                 st.markdown("</div>", unsafe_allow_html=True)
 
             # ── Competitor Comparison (auto-rendered when available) ───────────
@@ -1530,206 +1749,472 @@ with tab6:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TAB 7 — Position Tracking + Backlink Scout
+#  TAB 7 — Position Tracking + Citation Gap Scout
+# ══════════════════════════════════════════════════════════════════════════════#  TAB 7 — Position Tracking + Citation Gap Scout
+#  FIXED: Multi-keyword batch tracking, depth slider, result num fix
 # ══════════════════════════════════════════════════════════════════════════════
 with tab7:
+
+    # ── Mode selector ─────────────────────────────────────────────────────────
+    mode_col1, mode_col2 = st.columns(2)
+    with mode_col1:
+        track_mode = st.radio(
+            "Tracking mode",
+            ["Single Keyword", "Batch (Multiple Keywords)"],
+            horizontal=True, label_visibility="collapsed",
+        )
+    with mode_col2:
+        track_depth = st.select_slider(
+            "Scan depth (results)",
+            options=[10, 20, 30, 50, 100], value=50,
+            help="How many SERP results to scan per keyword. Higher = more credits used.",
+        )
+
+    # ── Shared: Target URL ────────────────────────────────────────────────────
     with st.container():
         st.markdown('<div class="v7-card">', unsafe_allow_html=True)
-        slabel("Keyword Position Tracker")
+        slabel("Position Tracker")
         st.markdown(
             '<div style="font-size:.82rem;opacity:.55;margin-bottom:14px;">'
-            'Checks where your URL ranks for a keyword. Uses already-fetched SERP data when '
-            'the keyword matches Tab 1 — no extra API credits used in that case.</div>',
+            'Enter your target URL/domain and one or more keywords. '
+            'Batch mode fires all keywords concurrently in background threads — '
+            'no waiting for each one to finish before the next starts.</div>',
             unsafe_allow_html=True)
-        pt1, pt2 = st.columns([3,3])
-        with pt1:
-            tracking_query = st.text_area(
+
+        tracking_url = st.text_input(
+            "track_url", label_visibility="collapsed",
+            placeholder="Your website URL or domain — e.g. https://digiasylum.com",
+            key="pt_url",
+        )
+
+        if track_mode == "Single Keyword":
+            tracking_query = st.text_input(
                 "track_kw", label_visibility="collapsed",
-                placeholder=("Enter one or more keywords, comma-separated or one per line. "
-                             "Example: shopify development company delhi\nshopify development services"),
-                key="pt_kw", height=120
+                placeholder="Target keyword — e.g. shopify development company delhi",
+                key="pt_kw",
             )
-        with pt2:
-            tracking_url = st.text_input("track_url", label_visibility="collapsed",
-                             placeholder="Your website URL or domain — e.g. https://digiasylum.com", key="pt_url")
-        tc1,tc2,tc3 = st.columns(3)
+            batch_keywords = [tracking_query] if tracking_query else []
+        else:
+            kw_textarea = st.text_area(
+                "batch_kw", label_visibility="collapsed",
+                placeholder=(
+                    "Enter one keyword per line:\n"
+                    "shopify development company delhi\n"
+                    "ecommerce agency india\n"
+                    "shopify seo services\n"
+                    "best shopify developer delhi"
+                ),
+                height=140, key="pt_kw_batch",
+            )
+            batch_keywords = [k.strip() for k in kw_textarea.splitlines() if k.strip()]
+            if batch_keywords:
+                st.markdown(
+                    f'<div style="font-size:.78rem;color:#10b981;margin-top:4px;">'
+                    f'✓ {len(batch_keywords)} keyword{"s" if len(batch_keywords)!=1 else ""} ready to track</div>',
+                    unsafe_allow_html=True)
+
+        tc1, tc2, tc3 = st.columns(3)
         with tc1: track_signals = st.checkbox("Capture SERP signals & AI Overview", value=True)
-        with tc2: track_links   = st.checkbox("Inspect target page links",           value=False)
-        with tc3: run_bl        = st.checkbox("Run Backlink Scout (link gap)",        value=True)
-        track_btn = st.button("📍 Track Position", disabled=not st.session_state.api_ok, key="track_btn")
+        with tc2: track_links   = st.checkbox("Inspect target page links",          value=False)
+        with tc3: run_bl        = st.checkbox("Run Citation Gap Scout",                 value=False)
+
+        if run_bl and len(batch_keywords) > 1:
+            st.warning("⚠️ Citation Gap Scout scans competitor pages — enabling it for batch tracking will use significant quota. Recommended only for single keyword mode.")
+
+        track_btn = st.button(
+            f"📍 Track {'All' if len(batch_keywords) > 1 else ''} {len(batch_keywords)} Keyword{'s' if len(batch_keywords)!=1 else ''}",
+            disabled=not st.session_state.api_ok or not batch_keywords or not tracking_url,
+            key="track_btn",
+        )
         with st.expander("ℹ️ How this works"):
             st.markdown(
-                "1. Fetches fresh SERP results for your keyword.  \n"
-                "2. Checks exact URL match first, then falls back to domain-level match.  \n"
-                "3. Optionally captures AI Overview, 9 SERP features, and target page links.  \n"
-                "4. If Backlink Scout is on, scans competitor pages for link gap opportunities.  \n"
-                "5. Every check is timestamped and saved to session history for export.")
+                "**Single keyword:** Full analysis — AI Overview, SERP features, top-10 view, interlinking signals, optional Citation Gap Scout (competitor citation analysis, not a verified backlink index).  \n"
+                "**Batch mode:** Fires all keywords concurrently (up to 5 at once). "
+                "Returns a ranked summary table — position, AI Overview presence, match type — for each keyword. "
+                "Each keyword costs 1 SerpAPI credit per 10 results scanned.  \n\n"
+                f"With depth={track_depth} and {max(len(batch_keywords),1)} keyword(s): "
+                f"~{max(len(batch_keywords),1) * (track_depth//10)} SerpAPI credit(s)."
+            )
         if not st.session_state.api_ok:
             st.info("🔑 Authenticate in the sidebar to use Position Tracking.")
         st.markdown("</div>", unsafe_allow_html=True)
 
-    if track_btn and tracking_query and tracking_url:
-        queries = parse_keywords_input(tracking_query)
-        if not queries:
-            st.error("❌ Please enter at least one keyword or phrase to track.")
-        else:
-            results = []
-            history_entries = []
-            status_slot = st.empty()
-            progress_bar = st.progress(0)
-            target_pg = cached_inspect_url(tracking_url) if track_links else None
-            with st.spinner(f"Fetching SERP for {len(queries)} keyword(s)…"):
-                for idx, q in enumerate(queries, start=1):
-                    status_slot.caption(f"Crawling {idx}/{len(queries)}: {q}")
-                    meta = st.session_state.get("serp_fetch_meta") or {}
-                    if (
-                        st.session_state.get("serp_data")
-                        and meta.get("query", "").strip().lower() == q.strip().lower()
-                        and meta.get("gl") == gl
-                        and meta.get("hl") == hl
-                        and int(meta.get("num", 0) or 0) >= int(num)
-                    ):
-                        serp_resp = st.session_state.serp_data
-                    else:
-                        serp_resp = cached_fetch_serp(st.session_state.api_key, q, gl, hl, num)
-                    if not serp_resp or "organic_results" not in serp_resp:
-                        results.append({
-                            "query": q,
-                            "error": "Failed to fetch SERP",
-                        })
-                        progress_bar.progress(idx / len(queries))
-                        continue
+    # ── Execute tracking ──────────────────────────────────────────────────────
+    if track_btn and batch_keywords and tracking_url:
 
+        if len(batch_keywords) == 1:
+            # ── Single keyword — full analysis ────────────────────────────────
+            kw = batch_keywords[0]
+            with st.spinner(f"Fetching SERP for '{kw}' (scanning top {track_depth} results)…"):
+                serp_resp = serp_analyzer.fetch_serp(
+                    st.session_state.api_key, kw, gl, hl, track_depth
+                )
+                if not serp_resp or "organic_results" not in serp_resp:
+                    st.error("❌ Could not fetch SERP. Check your API key and quota.")
+                else:
+                    st.session_state["_last_tracker_serp"] = serp_resp
+                    st.session_state["recovery_plan"]    = None  # reset stale plan from a prior keyword
+                    st.session_state["improvement_plan"] = None
                     organic    = serp_resp.get("organic_results", [])
                     tracker    = serp_analyzer.query_position_tracker(tracking_url, organic)
                     features   = serp_analyzer.extract_serp_features(serp_resp)               if track_signals else None
                     ai_ov      = serp_analyzer.build_ai_overview(serp_resp, st.session_state.api_key) if track_signals else None
                     ai_check   = serp_analyzer.check_ai_overview_presence(tracking_url, serp_resp)    if track_signals else None
+                    paa_check  = serp_analyzer.check_paa_presence(tracking_url, serp_resp)            if track_signals else None
                     interlinks = serp_analyzer.get_interlinking_signals(tracking_url, organic)
-                    bl_data    = serp_analyzer.fetch_backlink_signals(organic, tracking_url)  if run_bl else None
-                    raw_results = [{"pos":r.get("position"),"title":serp_analyzer._clean(r.get("title","")),"url":r.get("link","")} for r in organic[:num]]
-                    results.append({
-                        "query": q,
-                        "tracker": tracker,
-                        "features": features,
-                        "ai_overview": ai_ov,
-                        "ai_check": ai_check,
-                        "interlinking": interlinks,
-                        "target_page_data": target_pg,
-                        "raw_results": raw_results,
-                        "results_fetched": len(organic),
-                        "bl_data": bl_data,
-                    })
-                    history_entries.append({
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "query": q,
-                        "target_url": tracking_url,
-                        "results_fetched": len(organic),
-                        "result_limit": num,
-                        "position": tracker["position"],
-                        "found": tracker["found"],
-                        "serp_signals": track_signals,
-                        "link_audit": track_links,
-                        "backlink_scout": run_bl,
-                    })
-                    progress_bar.progress(idx / len(queries))
+                    target_pg  = cached_inspect_url(tracking_url) if track_links else None
+                    bl_data    = serp_analyzer.fetch_backlink_signals(organic, tracking_url)   if run_bl else None
+                    raw_top10  = [
+                        {"pos": r.get("position"),
+                         "title": serp_analyzer._clean(r.get("title", "")),
+                         "url": r.get("link", "")}
+                        for r in organic[:10]
+                    ]
+                    st.session_state.position_tracker = {
+                        "query": kw, "target_url": tracking_url,
+                        "tracker": tracker, "features": features,
+                        "ai_overview": ai_ov, "ai_check": ai_check, "paa_check": paa_check,
+                        "interlinking": interlinks, "target_page_data": target_pg,
+                        "raw_top10": raw_top10, "bl_data": bl_data,
+                        "depth": track_depth,
+                    }
+                    # Add to history
+                    st.session_state.position_tracker_history = [
+                        {
+                            "timestamp":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "query":         kw,
+                            "target_url":    tracking_url,
+                            "position":      tracker["position"],
+                            "found":         tracker["found"],
+                            "depth":         track_depth,
+                            "serp_signals":  track_signals,
+                            "link_audit":    track_links,
+                            "backlink_scout":run_bl,
+                        },
+                        *st.session_state.position_tracker_history,
+                    ]
 
-            status_slot.empty()
-            progress_bar.empty()
-            st.session_state.position_tracker = {
-                "queries": queries,
-                "target_url": tracking_url,
-                "num_results": num,
-                "results": results,
-            }
-            st.session_state.position_tracker_history = [*history_entries, *st.session_state.position_tracker_history]
+        else:
+            # ── Batch mode — concurrent multi-keyword tracking ────────────────
+            with st.spinner(
+                f"Tracking {len(batch_keywords)} keywords concurrently "
+                f"(scanning top {track_depth} results each)…"
+            ):
+                batch_results = serp_analyzer.batch_position_tracker(
+                    st.session_state.api_key,
+                    batch_keywords,
+                    tracking_url,
+                    gl=gl, hl=hl, num=track_depth,
+                )
+                st.session_state.batch_tracking_results = batch_results
+                # Also push to history log
+                new_entries = [
+                    {
+                        "timestamp":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "query":         r["keyword"],
+                        "target_url":    tracking_url,
+                        "position":      r.get("position"),
+                        "found":         r.get("found", False),
+                        "depth":         track_depth,
+                        "serp_signals":  track_signals,
+                        "link_audit":    False,
+                        "backlink_scout":False,
+                    }
+                    for r in batch_results
+                ]
+                st.session_state.position_tracker_history = (
+                    new_entries + st.session_state.position_tracker_history
+                )
+                st.success(
+                    f"✅ Batch complete — {len(batch_results)} keywords tracked across top {track_depth} results."
+                )
 
-    if st.session_state.get("position_tracker"):
-        td = st.session_state["position_tracker"]
-        results = td.get("results", [])
-        result_limit = td.get("num_results", num)
+    # ── Batch results view ────────────────────────────────────────────────────
+    batch_results = st.session_state.get("batch_tracking_results", [])
+    if batch_results and len(batch_keywords) != 1:
+        with st.container():
+            st.markdown('<div class="v7-card">', unsafe_allow_html=True)
+            slabel(f"Batch Results — {len(batch_results)} Keywords · {tracking_url}")
 
-        summary_rows = []
-        for item in results:
-            if item.get("error"):
-                summary_rows.append({
-                    "Keyword": item["query"],
-                    "Position": "Error",
-                    "Found": "No",
-                    "Details": item["error"],
-                })
-            else:
-                tracker = item["tracker"]
-                summary_rows.append({
-                    "Keyword": item["query"],
-                    "Position": f"#{tracker['position']}" if tracker["found"] else f"Not in top {result_limit}",
-                    "Found": "Yes" if tracker["found"] else "No",
-                    "Fetched": item.get("results_fetched", 0),
-                    "Details": ", ".join(
-                        {"Exact match": "Exact URL", "Domain match": "Domain"}.get(mt, mt)
-                        for _, _, mt in tracker.get("matches", [])
-                    ),
-                })
+            # Summary metrics
+            found_count  = sum(1 for r in batch_results if r.get("found"))
+            in_ai_count  = sum(1 for r in batch_results if r.get("in_ai_overview"))
+            in_paa_count = sum(1 for r in batch_results if r.get("in_paa"))
+            avg_pos      = round(
+                sum(r["position"] for r in batch_results if r.get("position")) /
+                max(sum(1 for r in batch_results if r.get("position")), 1), 1
+            )
+            bm1, bm2, bm3, bm4, bm5 = st.columns(5)
+            bm1.metric("Keywords Tracked",  len(batch_results))
+            bm2.metric("Found in SERP",     f"{found_count}/{len(batch_results)}")
+            bm3.metric("In AI Overview",    in_ai_count)
+            bm4.metric("In PAA",            in_paa_count)
+            bm5.metric("Avg Position",      avg_pos if found_count else "—")
+
+            st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
+
+            # Per-keyword result rows
+            for r in batch_results:
+                pos       = r.get("position")
+                found     = r.get("found", False)
+                in_ai     = r.get("in_ai_overview", False)
+                in_paa    = r.get("in_paa", False)
+                has_error = bool(r.get("error"))
+
+                if has_error:
+                    row_bg, row_border = "rgba(239,68,68,.08)", "rgba(239,68,68,.2)"
+                    pos_label, pos_color = "Error", "#f87171"
+                elif found and pos and pos <= 3:
+                    row_bg, row_border = "rgba(16,185,129,.08)", "rgba(16,185,129,.25)"
+                    pos_label, pos_color = f"#{pos}", "#4ade80"
+                elif found and pos and pos <= 10:
+                    row_bg, row_border = "rgba(59,91,219,.08)", "rgba(59,91,219,.25)"
+                    pos_label, pos_color = f"#{pos}", "var(--primary-color,#3b5bdb)"
+                elif found:
+                    row_bg, row_border = "rgba(245,158,11,.07)", "rgba(245,158,11,.2)"
+                    pos_label, pos_color = f"#{pos}", "#f59e0b"
+                else:
+                    row_bg, row_border = "var(--secondary-background-color)", "rgba(148,163,184,.15)"
+                    pos_label, pos_color = "Not found", "#f87171"
+
+                ai_badge = (
+                    f'<span style="background:rgba(16,185,129,.15);color:#4ade80;'
+                    f'border-radius:5px;padding:2px 7px;font-size:.68rem;font-weight:600;margin-left:6px;">'
+                    f'AI #{r.get("ai_position")} of {r.get("ai_total_sources")}</span>'
+                    if in_ai else ""
+                )
+                paa_badge = (
+                    f'<span style="background:rgba(59,91,219,.15);color:var(--primary-color,#3b5bdb);'
+                    f'border-radius:5px;padding:2px 7px;font-size:.68rem;font-weight:600;margin-left:6px;">'
+                    f'PAA #{r.get("paa_position")}</span>'
+                    if in_paa else ""
+                )
+                snippet_html = (
+                    f'<div style="font-size:.72rem;opacity:.45;margin-top:3px;'
+                    f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">'
+                    f'{html_lib.escape(r.get("snippet","")[:100])}</div>'
+                    if r.get("snippet") else ""
+                )
+
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:14px;padding:10px 14px;'
+                    f'background:{row_bg};border:1px solid {row_border};'
+                    f'border-radius:10px;margin-bottom:7px;">'
+                    f'<div style="min-width:60px;text-align:center;flex-shrink:0;">'
+                    f'<div style="font-size:1.2rem;font-weight:800;color:{pos_color};">{pos_label}</div>'
+                    f'</div>'
+                    f'<div style="flex:1;min-width:0;">'
+                    f'<div style="font-size:.86rem;font-weight:600;">'
+                    f'{html_lib.escape(r["keyword"])}{ai_badge}{paa_badge}</div>'
+                    f'{snippet_html}'
+                    f'<div style="font-size:.7rem;opacity:.4;font-family:monospace;margin-top:2px;'
+                    f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">'
+                    f'{html_lib.escape(r.get("matched_url","")[:80])}</div>'
+                    f'</div>'
+                    f'<div style="font-size:.68rem;opacity:.45;flex-shrink:0;text-align:right;">'
+                    f'{html_lib.escape(r.get("match_type",""))}<br>'
+                    f'top {r.get("total_scanned",0)} scanned</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            # Export batch results
+            batch_df = pd.DataFrame([{
+                "Keyword":       r["keyword"],
+                "Position":      r.get("position") or "Not found",
+                "Found":         "Yes" if r.get("found") else "No",
+                "In AI Overview":"Yes" if r.get("in_ai_overview") else "No",
+                "AI Position":   r.get("ai_position") or "",
+                "AI Total Sources": r.get("ai_total_sources") or "",
+                "In PAA":        "Yes" if r.get("in_paa") else "No",
+                "PAA Position":  r.get("paa_position") or "",
+                "PAA Question":  r.get("paa_question",""),
+                "Match Type":    r.get("match_type",""),
+                "Matched URL":   r.get("matched_url",""),
+                "Scanned":       r.get("total_scanned",0),
+                "Checked At":    r.get("checked_at",""),
+            } for r in batch_results])
+            st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
+            st.download_button(
+                "⬇️ Download Batch Results CSV",
+                batch_df.to_csv(index=False).encode(),
+                f"batch-position-tracking-{datetime.now().strftime('%Y%m%d-%H%M')}.csv",
+                "text/csv",
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Single keyword detailed result ────────────────────────────────────────
+    td = st.session_state.get("position_tracker")
+    if td and (len(batch_keywords) == 1 or not batch_results):
+        track    = td["tracker"]
+        depth_used = td.get("depth", track_depth)
+        pos_label = f"#{track['position']}" if track["found"] else f"Not in top {depth_used}"
 
         with st.container():
             st.markdown('<div class="v7-card">', unsafe_allow_html=True)
-            slabel("Tracking Summary")
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, height=240)
+            slabel("Single Keyword Result")
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Current Position", pos_label)
+            s2.metric("Matches Found",    len(track["matches"]))
+            s3.metric("Results Scanned",  depth_used)
+            s4.metric("Link Audit",       "✓ Captured" if td.get("target_page_data") else "Skipped")
+
+            if track["found"]:
+                st.success(
+                    f'✅ **{html_lib.escape(td["target_url"])}** '
+                    f'ranks at **{pos_label}** for '
+                    f'"{html_lib.escape(td["query"])}"'
+                )
+            elif track["matches"]:
+                st.warning("⚠️ Domain found but no exact URL match. See match table below.")
+            else:
+                st.info(f'ℹ️ Not found in the top {depth_used} results for this keyword.')
             st.markdown("</div>", unsafe_allow_html=True)
 
-        detail_items = [item for item in results if not item.get("error")]
-        item = None
-        if detail_items:
-            if len(detail_items) > 1:
-                with st.container():
-                    st.markdown('<div class="v7-card">', unsafe_allow_html=True)
-                    slabel("Keyword Details")
-                    selected_idx = st.selectbox(
-                        "Select keyword details",
-                        range(len(detail_items)),
-                        format_func=lambda i: detail_items[i]["query"],
-                        label_visibility="collapsed",
-                    )
-                    item = detail_items[selected_idx]
-                    st.markdown("</div>", unsafe_allow_html=True)
-            else:
-                item = detail_items[0]
-
-        if item:
-            track = item["tracker"]
-            pos_label = f"#{track['position']}" if track["found"] else f"Not in top {result_limit}"
-
+        # ── Improvement Plan — only surfaces when found, but not already #1 ────
+        if track["found"] and track.get("position") and track["position"] > 1:
             with st.container():
                 st.markdown('<div class="v7-card">', unsafe_allow_html=True)
-                slabel("Tracking Result")
-                s1,s2,s3,s4 = st.columns(4)
-                s1.metric("Current Position", pos_label)
-                s2.metric("Matches Found",    len(track["matches"]))
-                s3.metric("SERP Signals",     "✓ Captured" if item.get("features") else "Skipped")
-                s4.metric("Link Audit",       "✓ Captured" if item.get("target_page_data") else "Skipped")
-                if track["found"]:
-                    st.success(f'✅ **{html_lib.escape(td["target_url"])}** ranks at **{pos_label}** for "{html_lib.escape(item["query"])}"')
-                elif track["matches"]:
-                    st.warning("⚠️ Domain found but no exact URL match. See match table below.")
-                else:
-                    st.info(f'ℹ️ Not found in the top {result_limit} results for this keyword.')
+                slabel("📈 How do we move up?")
+                st.markdown(
+                    f'<div style="font-size:.78rem;opacity:.5;margin-bottom:10px;">'
+                    f'Scrapes the real content, headings, and style of the {min(track["position"]-1, 5)} '
+                    f'page(s) ranking above you at #{track["position"]}, and builds a specific gap-closing plan '
+                    f'— not generic advice.</div>',
+                    unsafe_allow_html=True,
+                )
+                if st.button("Generate Improvement Plan", key="improvement_plan_btn"):
+                    _serp_for_plan = st.session_state.get("_last_tracker_serp", {})
+                    _organic = _serp_for_plan.get("organic_results", [])
+                    _pages_above = [r for r in _organic if r.get("position") and r["position"] < track["position"]][:5]
+                    if not _pages_above:
+                        st.warning("Couldn't find the pages ranking above you in this session — re-run tracking and try again.")
+                    else:
+                        with st.spinner(f"Scraping {len(_pages_above)} page(s) currently outranking you…"):
+                            pages_above_content = serp_analyzer.analyze_serp_content(_pages_above)
+                        with st.spinner("Building your gap-closing plan…"):
+                            plan = ai_seo.get_improvement_plan(
+                                query=td["query"], target_url=td["target_url"], target_position=track["position"],
+                                pages_above_content=pages_above_content,
+                                target_page_data=td.get("target_page_data"),
+                                bl_data=td.get("bl_data"),
+                                api_key=st.session_state.gemini_key if st.session_state.gemini_ok else "",
+                            )
+                            st.session_state["improvement_plan"] = plan
+
+                _ip = st.session_state.get("improvement_plan")
+                if _ip:
+                    _ip_badge = (
+                        '<span style="background:rgba(59,91,219,.15);color:var(--primary-color,#3b5bdb);border-radius:8px;'
+                        'padding:2px 9px;font-size:.68rem;font-weight:600;">🤖 AI-grounded</span>'
+                        if _ip.get("source") == "ai" else
+                        '<span style="background:rgba(148,163,184,.12);border-radius:8px;padding:2px 9px;'
+                        'font-size:.68rem;opacity:.55;">📐 Quick diagnostic</span>'
+                    )
+                    _effort_colors = {"Quick edit (hours)": "#4ade80", "Moderate rewrite (days)": "#f59e0b", "Major overhaul (weeks)": "#f87171"}
+                    _effort = _ip.get("estimated_effort", "")
+                    _effort_html = (
+                        f'<span style="background:rgba(148,163,184,.12);border-radius:8px;padding:2px 9px;'
+                        f'font-size:.68rem;color:{_effort_colors.get(_effort,"inherit")};margin-left:6px;">⏱ {html_lib.escape(_effort)}</span>'
+                        if _effort else ""
+                    )
+                    st.markdown(_ip_badge + _effort_html, unsafe_allow_html=True)
+                    st.markdown(f"**Gap Summary:** {html_lib.escape(_ip.get('position_gap_summary',''))}")
+
+                    ip1, ip2 = st.columns(2)
+                    with ip1:
+                        st.markdown("**Structural Gaps (headings you're missing)**")
+                        for g in _ip.get("structural_gaps", []):
+                            st.markdown(f"- {html_lib.escape(g)}", unsafe_allow_html=False)
+                        st.markdown(f"**Content Depth:** {html_lib.escape(_ip.get('content_depth_comparison',''))}")
+                    with ip2:
+                        st.markdown(f"**Style & Readability:** {html_lib.escape(_ip.get('style_readability_notes',''))}")
+                        st.markdown("**Citation Leads**")
+                        for c in _ip.get("citation_gap_recommendations", []):
+                            st.markdown(f"- {html_lib.escape(c)}", unsafe_allow_html=False)
+
+                    if _ip.get("priority_actions"):
+                        st.markdown(
+                            '<div class="ai-box" style="margin-top:10px;"><strong>🎯 Priority Actions:</strong><br>'
+                            + "<br>".join(f"{i+1}. {html_lib.escape(a)}" for i, a in enumerate(_ip["priority_actions"]))
+                            + '</div>', unsafe_allow_html=True,
+                        )
                 st.markdown("</div>", unsafe_allow_html=True)
 
-            if track["matches"]:
-                with st.container():
-                    st.markdown('<div class="v7-card">', unsafe_allow_html=True)
-                    slabel("Matching Results")
-                    st.dataframe(pd.DataFrame([{"Position":pos,"URL":url,"Match Type":mt} for pos,url,mt in track["matches"]]),
-                                 use_container_width=True, height=180)
-                    st.markdown("</div>", unsafe_allow_html=True)
-
-        raw_results = (item.get("raw_results") or item.get("raw_top10") or []) if item else []
-        if raw_results:
+        # ── Recovery Plan — only surfaces when the target wasn't found ─────────
+        if not track["found"]:
             with st.container():
                 st.markdown('<div class="v7-card">', unsafe_allow_html=True)
-                slabel(f"Top {len(raw_results)} Currently Ranking")
+                slabel("🩺 Why aren't we ranking?")
+                st.markdown(
+                    '<div style="font-size:.78rem;opacity:.5;margin-bottom:10px;">'
+                    'Diagnoses the gap between what\'s actually ranking and your page, '
+                    'and gives specific content + citation next steps.</div>',
+                    unsafe_allow_html=True,
+                )
+                if st.button("Generate Recovery Plan", key="recovery_plan_btn"):
+                    with st.spinner("Comparing your page against what's actually ranking…"):
+                        _serp_for_recovery = st.session_state.get("_last_tracker_serp", {})
+                        plan = ai_seo.get_recovery_plan(
+                            query=td["query"], target_url=td["target_url"],
+                            serp_json=_serp_for_recovery,
+                            target_page_data=td.get("target_page_data"),
+                            bl_data=td.get("bl_data"),
+                            api_key=st.session_state.gemini_key if st.session_state.gemini_ok else "",
+                        )
+                        st.session_state["recovery_plan"] = plan
+
+                _rp = st.session_state.get("recovery_plan")
+                if _rp:
+                    _rp_badge = (
+                        '<span style="background:rgba(59,91,219,.15);color:var(--primary-color,#3b5bdb);border-radius:8px;'
+                        'padding:2px 9px;font-size:.68rem;font-weight:600;">🤖 AI-grounded</span>'
+                        if _rp.get("source") == "ai" else
+                        '<span style="background:rgba(148,163,184,.12);border-radius:8px;padding:2px 9px;'
+                        'font-size:.68rem;opacity:.55;">📐 Quick diagnostic</span>'
+                    )
+                    st.markdown(_rp_badge, unsafe_allow_html=True)
+                    st.markdown(f"**Pattern:** {html_lib.escape(_rp.get('competitor_pattern_summary',''))}")
+                    rp1, rp2 = st.columns(2)
+                    with rp1:
+                        st.markdown("**Likely Reasons**")
+                        for reason in _rp.get("likely_reasons", []):
+                            st.markdown(f"- {html_lib.escape(reason)}", unsafe_allow_html=False)
+                        st.markdown("**Content Recommendations**")
+                        for c in _rp.get("content_recommendations", []):
+                            st.markdown(f"- {html_lib.escape(c)}", unsafe_allow_html=False)
+                    with rp2:
+                        st.markdown(f"**Page Strategy:** {html_lib.escape(_rp.get('target_page_recommendation',''))}")
+                        st.markdown("**Citation Leads**")
+                        for c in _rp.get("citation_recommendations", []):
+                            st.markdown(f"- {html_lib.escape(c)}", unsafe_allow_html=False)
+                    if _rp.get("quick_wins"):
+                        st.markdown(
+                            '<div class="ai-box" style="margin-top:10px;"><strong>⚡ Quick Wins:</strong><br>'
+                            + "<br>".join(f"• {html_lib.escape(q)}" for q in _rp["quick_wins"])
+                            + '</div>', unsafe_allow_html=True,
+                        )
+                st.markdown("</div>", unsafe_allow_html=True)
+
+        if track["matches"]:
+            with st.container():
+                st.markdown('<div class="v7-card">', unsafe_allow_html=True)
+                slabel("Matching Results")
+                st.dataframe(
+                    pd.DataFrame([
+                        {"Position": pos, "URL": url, "Match Type": mt}
+                        for pos, url, mt in track["matches"]
+                    ]),
+                    use_container_width=True, height=180,
+                )
+                st.markdown("</div>", unsafe_allow_html=True)
+
+        if td.get("raw_top10"):
+            with st.container():
+                st.markdown('<div class="v7-card">', unsafe_allow_html=True)
+                slabel(f"Top 10 of {depth_used} Scanned")
                 your_dom = domain_of(td["target_url"])
-                for r in raw_results:
+                for r in td["raw_top10"]:
                     is_you  = bool(your_dom and your_dom in domain_of(r["url"]))
                     bg      = "rgba(16,185,129,.1)"  if is_you else "var(--secondary-background-color)"
                     border  = "rgba(16,185,129,.3)"  if is_you else "rgba(148,163,184,.12)"
@@ -1743,98 +2228,165 @@ with tab7:
                         f'{html_lib.escape(r["title"])}{you_tag}</div>'
                         f'<div style="font-size:.7rem;opacity:.35;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">'
                         f'{html_lib.escape(r["url"])}</div></div></div>',
-                        unsafe_allow_html=True)
+                        unsafe_allow_html=True,
+                    )
                 st.markdown("</div>", unsafe_allow_html=True)
 
-        if item and item.get("features"):
+        if td.get("features"):
             with st.container():
                 st.markdown('<div class="v7-card">', unsafe_allow_html=True)
                 slabel("SERP Signal Snapshot")
-                FEAT_PT = {"has_ai_overview":"🤖 AI Overview","has_paa":"❓ PAA",
-                           "has_knowledge":"🧠 Knowledge Graph","has_shopping":"🛒 Shopping",
-                           "has_local_pack":"📍 Local Pack","has_top_stories":"📰 Top Stories",
-                           "has_images":"🖼️ Images","has_videos":"▶️ Videos","has_sitelinks":"🔗 Sitelinks"}
+                FEAT_PT = {
+                    "has_ai_overview":"🤖 AI Overview",  "has_paa":"❓ PAA",
+                    "has_knowledge":  "🧠 Knowledge",    "has_shopping":"🛒 Shopping",
+                    "has_local_pack": "📍 Local Pack",   "has_top_stories":"📰 Top Stories",
+                    "has_images":     "🖼️ Images",        "has_videos":"▶️ Videos",
+                    "has_sitelinks":  "🔗 Sitelinks",
+                }
                 feat_cols = st.columns(3)
-                for i,(key,label) in enumerate(FEAT_PT.items()):
-                    p = item["features"].get(key,False)
-                    with feat_cols[i%3]:
+                for i, (key, label) in enumerate(FEAT_PT.items()):
+                    p = td["features"].get(key, False)
+                    with feat_cols[i % 3]:
                         st.markdown(
                             f'<div style="background:var(--secondary-background-color);'
                             f'border:1px solid rgba(148,163,184,.12);border-radius:10px;padding:10px 14px;margin-bottom:8px;">'
                             f'<strong style="font-size:.82rem;">{label}</strong>'
-                            f'<div style="margin-top:4px;color:{"#4ade80" if p else "#f87171"};font-size:.8rem;">{"✅ Present" if p else "✗ Not found"}</div></div>',
-                            unsafe_allow_html=True)
+                            f'<div style="margin-top:4px;color:{"#4ade80" if p else "#f87171"};font-size:.8rem;">'
+                            f'{"✅ Present" if p else "✗ Not found"}</div></div>',
+                            unsafe_allow_html=True,
+                        )
                 st.markdown("</div>", unsafe_allow_html=True)
 
-        if item and item.get("ai_overview"):
-            ai = item["ai_overview"]
+        if td.get("ai_overview"):
+            ai = td["ai_overview"]
             with st.container():
                 st.markdown('<div class="v7-card">', unsafe_allow_html=True)
                 slabel("AI Overview Preview")
-                preview = ai["text"] if ai["source"]=="Google AI" else html_lib.escape(ai["text"])
+                preview = ai["text"] if ai["source"] == "Google AI" else html_lib.escape(ai["text"])
                 st.markdown(f'<div class="ai-box">{preview}</div>', unsafe_allow_html=True)
-                if item.get("ai_check"):
-                    ac = item["ai_check"]
-                    if ac["in_ai_overview"]: st.success("✅ Your domain is cited as a source in the AI Overview.")
-                    else: st.warning("⚠️ Not in AI Overview. Deepen content, add schema markup, earn links from cited pages.")
+                if td.get("ai_check"):
+                    ac = td["ai_check"]
+                    if ac["in_ai_overview"]:
+                        pos_txt = f"source #{ac['best_position']} of {ac['total_sources']}" if ac.get("total_sources") else "a cited source"
+                        st.success(f"✅ Your domain is cited as **{pos_txt}** in the AI Overview.")
+                        if ac.get("context_snippets"):
+                            st.markdown("**Where you're mentioned:**")
+                            for snip in ac["context_snippets"]:
+                                st.markdown(
+                                    f'<div style="font-size:.82rem;background:rgba(59,91,219,.07);border-left:3px solid var(--primary-color,#3b5bdb);'
+                                    f'padding:8px 12px;border-radius:0 8px 8px 0;margin:4px 0;">{html_lib.escape(snip)}</div>',
+                                    unsafe_allow_html=True,
+                                )
+                    elif ac.get("total_sources"):
+                        st.warning(f"⚠️ Not among the {ac['total_sources']} cited sources in this AI Overview. Deepen content, add schema, earn links from cited pages.")
+                    else:
+                        st.warning("⚠️ Not in AI Overview. Deepen content, add schema, earn links from cited pages.")
                 st.markdown("</div>", unsafe_allow_html=True)
 
-        if item and item.get("interlinking"):
+        if td.get("paa_check"):
+            pc = td["paa_check"]
             with st.container():
                 st.markdown('<div class="v7-card">', unsafe_allow_html=True)
-                slabel("Interlinking Signals from Top-Ranked Pages")
-                for sig in item["interlinking"]:
-                    linked = sig.get("links_to_target",False)
-                    st.markdown(
-                        f'<div style="display:flex;gap:10px;align-items:center;padding:5px 0;border-bottom:1px solid rgba(148,163,184,.06);">'
-                        f'<span style="color:{"#4ade80" if linked else "#f87171"};font-size:.82rem;">{"🔗 Links to you" if linked else "✗ Does not link"}</span>'
-                        f'<span style="font-size:.76rem;opacity:.45;font-family:monospace;">{html_lib.escape(sig["ranked_page"][:80])}</span></div>',
-                        unsafe_allow_html=True)
+                slabel("People Also Ask — Source Position")
+                if pc["in_paa"]:
+                    st.success(f"✅ You're the cited source for {len(pc['matches'])} of {pc['total_paa_questions']} PAA question(s).")
+                    for m in pc["matches"]:
+                        st.markdown(
+                            f'<div style="background:var(--secondary-background-color);border:1px solid rgba(148,163,184,.12);'
+                            f'border-radius:10px;padding:12px 16px;margin-bottom:8px;">'
+                            f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+                            f'<strong style="font-size:.86rem;">{html_lib.escape(m["question"])}</strong>'
+                            f'<span style="font-size:.7rem;opacity:.5;background:rgba(59,91,219,.12);padding:2px 8px;border-radius:6px;">PAA #{m["position"]}</span>'
+                            f'</div>'
+                            + (f'<div style="font-size:.8rem;opacity:.65;margin-top:6px;">{html_lib.escape(m["snippet"])}</div>' if m.get("snippet") else "")
+                            + '</div>',
+                            unsafe_allow_html=True,
+                        )
+                elif pc["total_paa_questions"]:
+                    st.warning(f"⚠️ Not cited as the source for any of the {pc['total_paa_questions']} PAA questions on this SERP. Add direct, concise answers matching PAA phrasing to target these.")
+                else:
+                    st.caption("No People Also Ask box appeared for this query.")
                 st.markdown("</div>", unsafe_allow_html=True)
 
-        if item and item.get("target_page_data") and "error" not in item["target_page_data"]:
-            tp = item["target_page_data"]
+        if td.get("interlinking"):
+            with st.container():
+                st.markdown('<div class="v7-card">', unsafe_allow_html=True)
+                slabel("Interlinking Signals")
+                for sig in td["interlinking"]:
+                    linked = sig.get("links_to_target", False)
+                    st.markdown(
+                        f'<div style="display:flex;gap:10px;align-items:center;padding:5px 0;'
+                        f'border-bottom:1px solid rgba(148,163,184,.06);">'
+                        f'<span style="color:{"#4ade80" if linked else "#f87171"};font-size:.82rem;">'
+                        f'{"🔗 Links to you" if linked else "✗ Does not link"}</span>'
+                        f'<span style="font-size:.76rem;opacity:.45;font-family:monospace;">'
+                        f'{html_lib.escape(sig["ranked_page"][:80])}</span></div>',
+                        unsafe_allow_html=True,
+                    )
+                st.markdown("</div>", unsafe_allow_html=True)
+
+        if td.get("target_page_data") and "error" not in td["target_page_data"]:
+            tp = td["target_page_data"]
             with st.container():
                 st.markdown('<div class="v7-card">', unsafe_allow_html=True)
                 slabel("Target Page Link Audit")
-                c1,c2,c3 = st.columns(3)
-                c1.metric("Internal Links", len(tp.get("internal_links",[])))
-                c2.metric("External Links", len(tp.get("external_links",[])))
-                c3.metric("Word Count",     tp.get("word_count",0))
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Internal Links", len(tp.get("internal_links", [])))
+                c2.metric("External Links", len(tp.get("external_links", [])))
+                c3.metric("Word Count",     tp.get("word_count", 0))
                 with st.expander("View internal links"):
-                    if tp.get("internal_links"): st.dataframe(pd.DataFrame(tp["internal_links"]),use_container_width=True,height=200)
+                    if tp.get("internal_links"):
+                        st.dataframe(pd.DataFrame(tp["internal_links"]), use_container_width=True, height=200)
                 with st.expander("View external links"):
-                    if tp.get("external_links"): st.dataframe(pd.DataFrame(tp["external_links"]),use_container_width=True,height=200)
+                    if tp.get("external_links"):
+                        st.dataframe(pd.DataFrame(tp["external_links"]), use_container_width=True, height=200)
                 st.markdown("</div>", unsafe_allow_html=True)
 
-        bl = item.get("bl_data") if item else None
+        bl = td.get("bl_data")
         if bl:
             with st.container():
                 st.markdown('<div class="v7-card">', unsafe_allow_html=True)
-                slabel("Backlink Scout — Link Gap Analysis")
-                sm1,sm2,sm3 = st.columns(3)
-                sm1.metric("Referring Domains Scanned", bl["total_referring_domains"])
-                sm2.metric("Link Gap Opportunities",    len(bl["link_gap"]))
-                sm3.metric("Already Linking to You",    bl["your_referrer_count"])
+                slabel("Citation Gap Scout")
+                st.markdown(
+                    '<div style="font-size:.75rem;opacity:.4;margin:-6px 0 12px;">'
+                    'Scans outbound links on top-ranking competitor pages — the domains they cite/reference. '
+                    'This is a citation signal, not a verified backlink index (real inbound backlink data needs '
+                    'a paid index like Ahrefs/Majestic/Moz). Use it for outreach leads, not as a backlink audit.</div>',
+                    unsafe_allow_html=True,
+                )
+                sm1, sm2, sm3 = st.columns(3)
+                sm1.metric("Domains Cited by Competitors", bl["total_referring_domains"])
+                sm2.metric("Citation Gap Opportunities",   len(bl["link_gap"]))
+                sm3.metric("Competitor Pages Citing You",  bl["your_referrer_count"])
                 if bl["link_gap"]:
                     st.markdown(
-                        '<div style="font-size:.78rem;opacity:.45;margin:8px 0;">These domains link to your competitors but NOT to you — your highest-priority outreach targets.</div>',
-                        unsafe_allow_html=True)
+                        '<div style="font-size:.78rem;opacity:.45;margin:8px 0;">'
+                        'These domains are cited by your top-ranking competitors — worth exploring for guest posts, '
+                        'partnerships, or directory/resource-page outreach.</div>',
+                        unsafe_allow_html=True,
+                    )
                     for item in bl["link_gap"][:15]:
                         st.markdown(
                             f'<div class="bl-row"><div class="bl-dom">{html_lib.escape(item["domain"])}</div>'
-                            f'<div class="bl-anchor">{html_lib.escape(item["anchor"][:55]) if item["anchor"] else "—"}</div>'
+                            f'<div class="bl-anchor">{html_lib.escape(item.get("anchor","")[:55]) if item.get("anchor") else "—"}</div>'
                             f'<div class="bl-count">{item["count"]}×</div></div>',
-                            unsafe_allow_html=True)
-                    bl_slug = slugify(td["target_url"].replace("https://","").replace("http://","").split("/")[0])
-                    st.download_button("⬇️ Download Outreach List CSV",
+                            unsafe_allow_html=True,
+                        )
+                    bl_slug = slugify(
+                        td["target_url"].replace("https://", "").replace("http://", "").split("/")[0]
+                    )
+                    st.download_button(
+                        "⬇️ Download Outreach List CSV",
                         pd.DataFrame(bl["link_gap"]).to_csv(index=False).encode(),
-                        f"{bl_slug}-link-gap.csv","text/csv")
+                        f"{bl_slug}-citation-gap.csv", "text/csv",
+                    )
                 if bl.get("common_refs"):
-                    st.markdown("**Already linking to you:**")
-                    st.markdown(chips(bl["common_refs"],"chip-grn"), unsafe_allow_html=True)
+                    st.markdown("**Competitor pages that already cite/link to you:**")
+                    for pg in bl["common_refs"]:
+                        st.markdown(f'<div style="font-size:.82rem;padding:3px 0;opacity:.75;">🔗 {html_lib.escape(pg)}</div>', unsafe_allow_html=True)
                 st.markdown("</div>", unsafe_allow_html=True)
 
+    # ── Tracking history ──────────────────────────────────────────────────────
     if st.session_state.position_tracker_history:
         with st.container():
             st.markdown('<div class="v7-card">', unsafe_allow_html=True)
@@ -1843,16 +2395,24 @@ with tab7:
                 "Timestamp":      i["timestamp"],
                 "Keyword":        i["query"],
                 "URL":            i["target_url"],
-                "Position":       i["position"] if i["position"] is not None else "Not found",
-                "Found":          "Yes" if i["found"] else "No",
-                "Fetched":        i.get("results_fetched", ""),
-                "Limit":          i.get("result_limit", ""),
-                "SERP Signals":   "Yes" if i["serp_signals"]   else "No",
-                "Link Audit":     "Yes" if i["link_audit"]      else "No",
-                "Backlink Scout": "Yes" if i["backlink_scout"]  else "No",
+                "Position":       i["position"] if i.get("position") is not None else "Not found",
+                "Found":          "Yes" if i.get("found") else "No",
+                "Depth":          i.get("depth", "—"),
+                "SERP Signals":   "Yes" if i.get("serp_signals")   else "No",
+                "Link Audit":     "Yes" if i.get("link_audit")      else "No",
+                "Citation Gap Scout": "Yes" if i.get("backlink_scout")  else "No",
             } for i in st.session_state.position_tracker_history])
-            st.dataframe(history_df, use_container_width=True, height=240)
-            st.download_button("⬇️ Export History CSV",
-                history_df.to_csv(index=False).encode(),
-                "position-tracking-history.csv","text/csv")
+            st.dataframe(history_df, use_container_width=True, height=260)
+            col_exp, col_clear = st.columns([3,1])
+            with col_exp:
+                st.download_button(
+                    "⬇️ Export History CSV",
+                    history_df.to_csv(index=False).encode(),
+                    "position-tracking-history.csv", "text/csv",
+                )
+            with col_clear:
+                if st.button("🗑️ Clear History"):
+                    st.session_state.position_tracker_history = []
+                    st.session_state.batch_tracking_results   = []
+                    st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)

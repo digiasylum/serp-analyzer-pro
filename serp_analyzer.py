@@ -67,66 +67,75 @@ def detect_content_style(full_text: str, avg_sent_len: float, word_count: int) -
         "scores": signals,
     }
 
-# ── SERP Fetching ─────────────────────────────────────────────────────────────
-def fetch_serp(api_key: str, query: str, gl="in", hl="en", num=10) -> dict:
-    target = min(max(int(num or 10), 1), 100)
-    combined = []
-    seen = set()
-    response_template = {}
+# ── SERP Fetching — paginated for >10 results ────────────────────────────────
+# SerpAPI returns max 10 organic results per call regardless of `num`.
+# For >10 we must paginate using `start` (0, 10, 20…) and merge organics.
 
-    def _request(start: int, batch_num: int) -> dict:
+def fetch_serp(api_key: str, query: str, gl: str = "in", hl: str = "en", num: int = 10) -> dict:
+    """
+    Fetch organic SERP results for `query`.
+    Paginates transparently when num > 10 — each page costs 1 SerpAPI credit.
+    Returns a single merged dict with all organic_results combined.
+    """
+    num = min(num, 100)
+    page_size = 10  # SerpAPI hard limit per call
+
+    if num <= page_size:
+        # Single call — no pagination needed
+        # Always pass num explicitly so SerpAPI doesn't default to 10
         params = {
-            "engine": "google",
-            "q": query,
-            "api_key": api_key,
-            "gl": gl,
-            "hl": hl,
-            "num": batch_num,
+            "engine": "google", "q": query, "api_key": api_key,
+            "gl": gl, "hl": hl, "num": num,
         }
-        if start:
-            params["start"] = start
-        r = requests.get(SERPAPI_ENDPOINT, params=params, timeout=30)
-        r.raise_for_status()
-        return r.json()
+        try:
+            r = requests.get(SERPAPI_ENDPOINT, params=params, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            return {}
 
-    def _append_unique(page_results: list) -> int:
-        added = 0
-        for item in page_results:
-            url = normalize_url(item.get("link", ""))
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            row = dict(item)
-            row["position"] = len(combined) + 1
-            combined.append(row)
-            added += 1
-            if len(combined) >= target:
-                break
-        return added
+    # Multi-page: fetch pages concurrently to minimise wall time
+    starts      = list(range(0, num, page_size))           # [0, 10, 20, ...]
+    page_results: dict[int, dict] = {}
 
-    try:
-        first_page = _request(0, target)
-        response_template = first_page
-        _append_unique(first_page.get("organic_results", []) or [])
-    except Exception:
+    def _fetch_page(start: int) -> tuple[int, dict]:
+        params = {
+            "engine": "google", "q": query, "api_key": api_key,
+            "gl": gl, "hl": hl, "num": page_size, "start": start,
+        }
+        try:
+            r = requests.get(SERPAPI_ENDPOINT, params=params, timeout=45)
+            r.raise_for_status()
+            return start, r.json()
+        except Exception:
+            return start, {}
+
+    with ThreadPoolExecutor(max_workers=min(len(starts), 5)) as ex:
+        futures = {ex.submit(_fetch_page, s): s for s in starts}
+        for fut in as_completed(futures):
+            start, data = fut.result()
+            page_results[start] = data
+
+    # Use first page as the base (contains metadata, AI overview, PAA, etc.)
+    base = page_results.get(0, {})
+    if not base:
         return {}
 
-    if len(combined) < target:
-        for start in range(10, target, 10):
-            try:
-                data = _request(start, min(10, target - len(combined)))
-            except Exception:
-                break
+    # Merge organic_results from all pages in order, deduplicate by URL
+    merged_organics: list[dict] = []
+    seen_urls: set[str] = set()
+    for start in sorted(page_results.keys()):
+        page = page_results[start]
+        for result in page.get("organic_results", []):
+            url = result.get("link", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                # Re-number positions so they are continuous (1, 2, 3…)
+                result["position"] = len(merged_organics) + 1
+                merged_organics.append(result)
 
-            page_results = data.get("organic_results", []) or []
-            if not page_results:
-                break
-            _append_unique(page_results)
-            if len(combined) >= target:
-                break
-
-    response_template["organic_results"] = combined[:target]
-    return response_template
+    base["organic_results"] = merged_organics[:num]
+    return base
 
 # ── SERP Features ─────────────────────────────────────────────────────────────
 def extract_serp_features(serp_json: dict) -> dict:
@@ -502,39 +511,323 @@ def generate_query_fanout(query: str, related_kw: dict, serp_json: dict) -> dict
             "content_clusters":content_clusters,"paa":paa,"autocomplete":autocomplete,"related":related}
 
 # ── Position Tracking ─────────────────────────────────────────────────────────
+def classify_questions_by_type(queries: list) -> dict:
+    """
+    Answer-the-Public style bucketing: takes every REAL question/query already
+    collected (PAA, related searches, autocomplete, AI fan-out sub-queries) and
+    groups it by question type — Why / How / What / Best / Where / When /
+    Who / Is-Can-Does / Other — so a writer sees intent distribution at a glance
+    instead of one flat list. Deterministic and free (no AI call needed) since
+    this is pure prefix classification on real data, not generation.
+    """
+    buckets = {
+        "Why":   [], "How":   [], "What":  [], "Best / Compare": [],
+        "Where": [], "When":  [], "Who":   [], "Is / Can / Does": [], "Other": [],
+    }
+    seen = set()
+    for q in queries or []:
+        q = (q or "").strip()
+        if not q or q.lower() in seen:
+            continue
+        seen.add(q.lower())
+        ql = q.lower()
+        first_word = ql.split()[0] if ql.split() else ""
+
+        if first_word == "why":
+            buckets["Why"].append(q)
+        elif first_word in ("how",):
+            buckets["How"].append(q)
+        elif first_word == "what":
+            buckets["What"].append(q)
+        elif first_word == "where":
+            buckets["Where"].append(q)
+        elif first_word == "when":
+            buckets["When"].append(q)
+        elif first_word in ("who", "whose"):
+            buckets["Who"].append(q)
+        elif any(w in ql for w in ["best ", "top ", " vs ", "versus", "compare", "alternative", "cheapest", "cost of"]):
+            buckets["Best / Compare"].append(q)
+        elif first_word in ("is", "are", "can", "does", "do", "will", "should"):
+            buckets["Is / Can / Does"].append(q)
+        else:
+            buckets["Other"].append(q)
+
+    # Drop empty buckets so the UI only shows relevant categories
+    buckets = {k: v for k, v in buckets.items() if v}
+    total = sum(len(v) for v in buckets.values())
+    return {
+        "buckets": buckets,
+        "counts": {k: len(v) for k, v in buckets.items()},
+        "total_questions": total,
+    }
+
+
 def query_position_tracker(target_url: str, organic_results: list) -> dict:
+    """
+    Check where target_url (or its domain) appears in organic_results.
+    Returns position, all matches with type label, and found flag.
+    """
     target_norm   = normalize_url(target_url)
     target_domain = domain_of(target_url)
     position, matches = None, []
-    for result in organic_results:
-        result_url = normalize_url(result.get("link",""))
-        pos = result.get("position") or (organic_results.index(result)+1)
-        if not result_url: continue
+    for i, result in enumerate(organic_results):
+        result_url = normalize_url(result.get("link", ""))
+        pos = result.get("position") or (i + 1)
+        if not result_url:
+            continue
         if target_norm and target_norm == result_url:
-            position = pos; matches.append((pos,result.get("link",""),"Exact match"))
-        elif target_domain and target_domain in result_url:
-            if position is None: position = pos
-            matches.append((pos,result.get("link",""),"Domain match"))
-    return {"position":position,"matches":sorted(matches,key=lambda x:x[0]),"target_domain":target_domain,"found":position is not None}
+            if position is None:
+                position = pos
+            matches.append((pos, result.get("link",""), "Exact match"))
+        elif target_domain and target_domain == domain_of(result.get("link","")):
+            if position is None:
+                position = pos
+            matches.append((pos, result.get("link",""), "Domain match"))
+    return {
+        "position":    position,
+        "matches":     sorted(matches, key=lambda x: x[0]),
+        "target_domain": target_domain,
+        "found":       position is not None,
+    }
+
+
+def track_multiple_keywords(
+    api_key:    str,
+    keywords:   list[str],
+    target_url: str,
+    gl:         str = "in",
+    hl:         str = "en",
+    num:        int = 50,
+) -> list[dict]:
+    """
+    Track position of target_url across multiple keywords concurrently.
+    Each keyword fires a separate SerpAPI call in a background thread pool.
+    Returns a list of result dicts sorted by keyword, one per keyword.
+    """
+    results: list[dict] = []
+
+    def _track_one(keyword: str) -> dict:
+        serp = fetch_serp(api_key, keyword, gl, hl, num)
+        if not serp or "organic_results" not in serp:
+            return {
+                "keyword":      keyword,
+                "position":     None,
+                "found":        False,
+                "matches":      [],
+                "ai_overview":  False,
+                "total_results": 0,
+                "error":        "SERP fetch failed",
+            }
+        organic = serp.get("organic_results", [])
+        tracker = query_position_tracker(target_url, organic)
+        ai_check  = check_ai_overview_presence(target_url, serp)
+        paa_check = check_paa_presence(target_url, serp)
+        features = extract_serp_features(serp)
+        return {
+            "keyword":         keyword,
+            "position":        tracker["position"],
+            "found":           tracker["found"],
+            "matches":         tracker["matches"],
+            "in_ai_overview":  ai_check["in_ai_overview"],
+            "ai_position":     ai_check["best_position"],
+            "ai_total_sources":ai_check["total_sources"],
+            "in_paa":          paa_check["in_paa"],
+            "paa_position":    paa_check["matches"][0]["position"] if paa_check["matches"] else None,
+            "total_results":   len(organic),
+            "serp_features":   features,
+            "top_url":         organic[0].get("link","") if organic else "",
+            "top_title":       _clean(organic[0].get("title","")) if organic else "",
+        }
+
+    # Fire all keyword checks concurrently
+    max_workers = min(len(keywords), 8)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_track_one, kw): kw for kw in keywords}
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                results.append({
+                    "keyword":  futures[fut],
+                    "position": None,
+                    "found":    False,
+                    "matches":  [],
+                    "error":    str(e),
+                })
+
+    # Return sorted alphabetically by keyword for consistent display
+    results.sort(key=lambda x: x["keyword"].lower())
+    return results
+
+
+def batch_position_tracker(
+    api_key: str,
+    keywords: list,
+    target_url: str,
+    gl: str = "in",
+    hl: str = "en",
+    num: int = 50,
+) -> list:
+    """
+    Track position for MULTIPLE keywords in parallel.
+    Each keyword fires one concurrent SerpAPI call (max 5 workers).
+    Returns results in the same order as the keywords list.
+    """
+    from datetime import datetime as _dt
+
+    def _track_one(keyword):
+        try:
+            serp = fetch_serp(api_key, keyword, gl, hl, num)
+            if not serp or "organic_results" not in serp:
+                return {
+                    "keyword": keyword, "position": None, "found": False,
+                    "matched_url": "", "match_type": "error",
+                    "error": "SERP fetch failed",
+                    "checked_at": _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            organic = serp.get("organic_results", [])
+            tracker = query_position_tracker(target_url, organic)
+            matched_url = tracker["matches"][0][1] if tracker["matches"] else ""
+            match_type  = tracker["matches"][0][2] if tracker["matches"] else "Not found"
+            ai_check  = check_ai_overview_presence(target_url, serp)
+            paa_check = check_paa_presence(target_url, serp)
+            # Snippet from the matched result
+            snippet = ""
+            for r in organic:
+                if matched_url and matched_url in r.get("link",""):
+                    snippet = r.get("snippet","")
+                    break
+            return {
+                "keyword":         keyword,
+                "position":        tracker["position"],
+                "found":           tracker["found"],
+                "matched_url":     matched_url,
+                "match_type":      match_type,
+                "in_ai_overview":  ai_check["in_ai_overview"],
+                "ai_position":     ai_check["best_position"],
+                "ai_total_sources":ai_check["total_sources"],
+                "in_paa":          paa_check["in_paa"],
+                "paa_position":    paa_check["matches"][0]["position"] if paa_check["matches"] else None,
+                "paa_question":    paa_check["matches"][0]["question"] if paa_check["matches"] else "",
+                "snippet":         snippet,
+                "total_scanned":   len(organic),
+                "checked_at":      _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        except Exception as exc:
+            return {
+                "keyword": keyword, "position": None, "found": False,
+                "matched_url": "", "match_type": "error",
+                "error": str(exc),
+                "checked_at": _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+    results_map = {}
+    with ThreadPoolExecutor(max_workers=min(len(keywords), 5)) as ex:
+        future_map = {ex.submit(_track_one, kw): kw for kw in keywords}
+        for fut in as_completed(future_map):
+            kw = future_map[fut]
+            results_map[kw] = fut.result()
+
+    return [results_map.get(kw, {"keyword":kw,"position":None,"found":False}) for kw in keywords]
+
 
 def check_ai_overview_presence(target_url: str, serp_json: dict) -> dict:
+    """
+    Not just whether you're cited — WHERE. Returns citation position within the
+    AI Overview's source list (1 = cited first) and the actual snippet text the
+    citation supports, when Google's response makes that traceable.
+    """
     target_domain = domain_of(target_url)
-    ai_data = serp_json.get("ai_overview",{})
-    sources = ai_data.get("sources",[]) if ai_data else []
-    matched = [s.get("link","") for s in sources if target_domain and target_domain in domain_of(s.get("link",""))]
-    return {"in_ai_overview":len(matched)>0,"ai_source_urls":matched}
+    ai_data = serp_json.get("ai_overview", {}) or {}
+    sources = ai_data.get("sources", []) or []
+    total = len(sources)
+
+    matches = []
+    matched_titles = set()
+    for idx, s in enumerate(sources, start=1):
+        if target_domain and target_domain == domain_of(s.get("link", "")):
+            matches.append({"position": idx, "title": s.get("title", ""), "link": s.get("link", "")})
+            if s.get("title"):
+                matched_titles.add(s["title"])
+
+    context_snippets = []
+    if matched_titles:
+        for block in ai_data.get("text_blocks", []) or []:
+            snippet = block.get("snippet", "")
+            if snippet and any(t in snippet for t in matched_titles):
+                context_snippets.append(snippet)
+            for item in block.get("list", []) or []:
+                item_snip = item.get("snippet", "")
+                if (item.get("title") in matched_titles) or (item_snip and any(t in item_snip for t in matched_titles)):
+                    context_snippets.append(item_snip or item.get("title", ""))
+
+    return {
+        "in_ai_overview":  len(matches) > 0,
+        "total_sources":   total,
+        "matches":         matches,                                   # [{position, title, link}, ...]
+        "best_position":   matches[0]["position"] if matches else None,
+        "context_snippets":[c for c in dict.fromkeys(context_snippets)][:3],  # dedup, keep order
+        "ai_source_urls":  [m["link"] for m in matches],              # kept for backward-compat
+    }
+
+
+def check_paa_presence(target_url: str, serp_json: dict) -> dict:
+    """
+    Checks whether target_url/domain is the CITED SOURCE behind a People Also Ask
+    answer. Google attaches a source link+title to most (not all) PAA entries —
+    when it's your page, that's a very concrete "you're already answering this
+    question" signal, distinct from just ranking in the top 10.
+    """
+    target_domain = domain_of(target_url)
+    target_norm   = normalize_url(target_url)
+    paa = serp_json.get("related_questions", []) or []
+
+    matches = []
+    for idx, q in enumerate(paa, start=1):
+        link = q.get("link", "")
+        if not link:
+            continue
+        is_match = (target_norm and normalize_url(link) == target_norm) or \
+                   (target_domain and target_domain == domain_of(link))
+        if is_match:
+            matches.append({
+                "position": idx,
+                "question": q.get("question", ""),
+                "snippet":  q.get("snippet", ""),
+                "title":    q.get("title", ""),
+                "link":     link,
+            })
+
+    return {
+        "in_paa":              len(matches) > 0,
+        "total_paa_questions": len(paa),
+        "matches":             matches,   # [{position, question, snippet, title, link}, ...]
+    }
+
 
 def get_interlinking_signals(target_url: str, organic_results: list) -> list:
     target_domain = domain_of(target_url)
-    return [{"ranked_page":r.get("link",""),"links_to_target":target_domain in r.get("link","") if target_domain else False}
+    return [{"ranked_page":r.get("link",""),
+             "links_to_target": bool(target_domain) and target_domain == domain_of(r.get("link",""))}
             for r in organic_results[:5] if r.get("link")]
 
 # ── Backlink Scout ────────────────────────────────────────────────────────────
 def fetch_backlink_signals(organic_results: list, target_url: str) -> dict:
+    """
+    IMPORTANT — this is a CITATION scan, not a real backlink index.
+    It inspects each top-ranking competitor page's own OUTBOUND external links
+    (who they cite/reference/link out to) — that's the only signal obtainable by
+    scraping pages directly. True inbound backlink data (who links TO a page)
+    requires a paid crawl index like Ahrefs, Majestic, or Moz, which this tool
+    doesn't have access to. Treat "citation_gap" as outreach/partnership leads
+    worth investigating, not verified backlinks — and treat "pages_citing_you"
+    as confirmation that a competitor's page currently references your domain.
+    """
     from url_inspector import inspect_url
     target_domain = domain_of(target_url)
-    all_referring  = {}
-    your_referrers = set()
+    all_referring: dict = {}
+    pages_citing_you: list = []
+
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = {ex.submit(inspect_url,r.get("link","")): r for r in organic_results[:6] if r.get("link")}
         for fut in as_completed(futures):
@@ -544,21 +837,36 @@ def fetch_backlink_signals(organic_results: list, target_url: str) -> dict:
                 if "error" in data: continue
                 for ext in data.get("external_links",[]):
                     ext_dom = domain_of(ext["url"])
-                    if not ext_dom or ext_dom==target_domain: continue
+                    if not ext_dom:
+                        continue
+                    if ext_dom == target_domain:
+                        # This competitor page already cites/links to you —
+                        # not an outreach target, so track it separately.
+                        pages_citing_you.append(comp_url)
+                        continue
                     if ext_dom not in all_referring:
-                        all_referring[ext_dom]={"count":0,"pages":[],"anchor_texts":[],"links_to_you":False}
-                    all_referring[ext_dom]["count"]+=1
+                        all_referring[ext_dom] = {"count": 0, "pages": [], "anchor_texts": []}
+                    all_referring[ext_dom]["count"] += 1
                     all_referring[ext_dom]["pages"].append(comp_url)
-                    if ext.get("text"): all_referring[ext_dom]["anchor_texts"].append(ext["text"][:60])
-                    if target_domain and target_domain in ext["url"]:
-                        all_referring[ext_dom]["links_to_you"]=True; your_referrers.add(ext_dom)
-            except: continue
-    sorted_refs = sorted(all_referring.items(),key=lambda x:x[1]["count"],reverse=True)
-    link_gap = [{"domain":dom,"count":info["count"],"sample_page":info["pages"][0] if info["pages"] else "",
-                 "anchor":info["anchor_texts"][0] if info["anchor_texts"] else ""}
-                for dom,info in sorted_refs if not info["links_to_you"]][:30]
-    return {"total_referring_domains":len(all_referring),"link_gap":link_gap,
-            "common_refs":list(your_referrers)[:10],"your_referrer_count":len(your_referrers)}
+                    if ext.get("text"):
+                        all_referring[ext_dom]["anchor_texts"].append(ext["text"][:60])
+            except Exception:
+                continue
+
+    sorted_refs = sorted(all_referring.items(), key=lambda x: x[1]["count"], reverse=True)
+    citation_gap = [
+        {"domain": dom, "count": info["count"],
+         "sample_page": info["pages"][0] if info["pages"] else "",
+         "anchor": info["anchor_texts"][0] if info["anchor_texts"] else ""}
+        for dom, info in sorted_refs
+    ][:30]
+
+    return {
+        "total_referring_domains": len(all_referring),
+        "link_gap": citation_gap,
+        "common_refs": list(dict.fromkeys(pages_citing_you))[:10],  # dedup, preserve order
+        "your_referrer_count": len(set(pages_citing_you)),
+    }
 
 # ── CTAs & Brief ─────────────────────────────────────────────────────────────
 def ctas_for_intent(intent: str) -> list:
@@ -713,6 +1021,21 @@ def generate_topical_authority(brief_data: dict) -> dict:
         "description": f"Comprehensive overview of {query}. Links to supporting pages and covers core search intent.",
     }
 
+    return build_topical_plan_from_clusters(query, pillar, clusters, semantic, related, autocomplete)
+
+
+def build_topical_plan_from_clusters(
+    query: str, pillar: dict, clusters: list, semantic: list, related: list, autocomplete: list
+) -> dict:
+    """
+    Deterministic plan-builder shared by the formula-based generate_topical_authority()
+    and the Gemini-powered ai_seo.get_topical_authority(). Takes a pillar + a list of
+    subtopic clusters (however they were produced) and turns them into a content plan,
+    internal-link map, publishing calendar, and coverage/authority scores.
+
+    Each cluster dict needs: name, intent, description, topics (list[str]), priority (1-3),
+    word_count (int).
+    """
     content_plan = [pillar]
     seen_titles = set()
     for cluster in clusters:
@@ -762,11 +1085,17 @@ def generate_topical_authority(brief_data: dict) -> dict:
             "priority": article["priority"],
         })
 
-    has_informational = any(c["name"] == "Educational / How-to" for c in clusters)
-    has_commercial = any(c["name"] == "Comparisons & Reviews" for c in clusters)
-    has_transactional = any(c["name"] == "Pricing & Services" for c in clusters)
-    has_faq = any(c["name"] == "FAQ & People Also Ask" for c in clusters)
-    has_local = any(c["name"] == "Local & Geographic" for c in clusters)
+    # Intent-based coverage checks (works for both formula cluster names and
+    # free-form AI-generated cluster names, since both always set "intent").
+    cluster_intents = {c.get("intent", "") for c in clusters}
+    has_informational = "Informational" in cluster_intents
+    has_commercial    = "Commercial" in cluster_intents
+    has_transactional = "Transactional" in cluster_intents
+    has_local         = "Navigational" in cluster_intents or any(
+        "local" in c.get("name", "").lower() or "geo" in c.get("name", "").lower() for c in clusters
+    )
+    has_faq = any("faq" in c.get("name", "").lower() or "paa" in c.get("name", "").lower()
+                  or "question" in c.get("name", "").lower() for c in clusters)
 
     coverage_score = round((len(clusters) / 6) * 100)
     authority_score = sum([
@@ -776,6 +1105,8 @@ def generate_topical_authority(brief_data: dict) -> dict:
         15 if has_faq else 0,
         15 if has_local else 0,
     ])
+    coverage_score = min(coverage_score, 100)
+    authority_score = min(authority_score, 100)
 
     gap_recommendations = []
     if not has_informational: gap_recommendations.append("Add a deep how-to or explainer pillar for the core topic.")
@@ -783,7 +1114,6 @@ def generate_topical_authority(brief_data: dict) -> dict:
     if not has_transactional: gap_recommendations.append("Add a pricing, services, or product page to capture transactional intent.")
     if not has_faq: gap_recommendations.append("Add FAQ pages that answer People Also Ask queries directly.")
     if not has_local: gap_recommendations.append("Add local or geo-specific landing pages if your audience is location-based.")
-    if not ai_queries: gap_recommendations.append("Add AI-friendly angles and answer-style pages to target featured snippets and AI summaries.")
     if not gap_recommendations:
         gap_recommendations.append("Your topical authority plan is comprehensive. Follow the content plan and internal linking map next.")
 
