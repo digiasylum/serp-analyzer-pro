@@ -359,6 +359,8 @@ _DEFAULTS: dict = {
     "ai_content_brief":         None,
     "recovery_plan":            None,
     "improvement_plan":         None,
+    "llm_citation":             None,
+    "standalone_llm_citation":  None,
     "_last_tracker_serp":       None,
     "brief_data":               None,
     "serp_data":                None,
@@ -1755,6 +1757,59 @@ with tab6:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab7:
 
+    # ── Standalone LLM Citation Check — works with ONLY a Gemini key, no SerpAPI ──
+    # Everything else in this tab needs a real ranked SERP (SerpAPI), which Gemini's
+    # grounding tool can't provide. This one check genuinely doesn't need SerpAPI at
+    # all, so it's pulled out here as its own entry point rather than gated behind a
+    # SerpAPI-based tracking run.
+    with st.expander("🔮 Quick LLM Citation Check — works with just a Gemini key, no SerpAPI needed", expanded=not st.session_state.api_ok):
+        st.markdown(
+            '<div style="font-size:.78rem;opacity:.5;margin-bottom:10px;">'
+            'Asks Gemini your query directly with live Google Search grounding on, and checks whether '
+            'your domain shows up in what it actually cites. This is independent of SerpAPI — useful if '
+            'you haven\'t connected a SerpAPI key yet, or just want a fast standalone check.</div>',
+            unsafe_allow_html=True,
+        )
+        if not st.session_state.gemini_ok:
+            st.caption("Connect a Gemini API key in the sidebar to use this.")
+        else:
+            qc1, qc2 = st.columns(2)
+            with qc1:
+                quick_query = st.text_input("Query", key="quick_llm_query", placeholder="e.g. best shopify agency delhi ncr")
+            with qc2:
+                quick_url = st.text_input("Your URL or domain", key="quick_llm_url", placeholder="e.g. https://digiasylum.com")
+            if st.button("Check Gemini Citation", key="standalone_llm_citation_btn", disabled=not (quick_query and quick_url)):
+                with st.spinner("Asking Gemini directly, with search grounding on…"):
+                    st.session_state["standalone_llm_citation"] = ai_seo.get_llm_citation_check(
+                        quick_query, quick_url, st.session_state.gemini_key
+                    )
+            _slc = st.session_state.get("standalone_llm_citation")
+            if _slc:
+                if not _slc.get("ok"):
+                    st.warning(f"⚠️ Could not complete the check ({_slc.get('error', 'unknown error')}).")
+                else:
+                    if _slc["cited"]:
+                        st.success(f"✅ Gemini cites your domain as source #{_slc['position']} of {_slc['total_citations']} in its grounded answer.")
+                    elif _slc["total_citations"]:
+                        st.warning(f"⚠️ Gemini answered using {_slc['total_citations']} source(s), but your domain wasn't one of them.")
+                    else:
+                        st.info("ℹ️ Gemini answered without citing any external sources for this query.")
+                    if _slc.get("all_citations"):
+                        for i, c in enumerate(_slc["all_citations"], start=1):
+                            _is_you = any(m["url"] == c["url"] for m in _slc.get("matches", []))
+                            st.markdown(
+                                f'<div style="font-size:.82rem;padding:4px 0;'
+                                f'{"font-weight:700;color:#4ade80;" if _is_you else "opacity:.7;"}">'
+                                f'{i}. {"✓ " if _is_you else ""}{html_lib.escape(c.get("title","") or c.get("url",""))}</div>',
+                                unsafe_allow_html=True,
+                            )
+                    if _slc.get("answer_excerpt"):
+                        with st.expander("View Gemini's grounded answer"):
+                            st.markdown(html_lib.escape(_slc["answer_excerpt"]))
+
+    if not st.session_state.api_ok:
+        st.info("ℹ️ Everything below this point needs a SerpAPI key — it reads real Google ranking data that Gemini's grounding tool can't provide. Connect one in the sidebar to unlock Position Tracking and Citation Gap Scout.")
+
     # ── Mode selector ─────────────────────────────────────────────────────────
     mode_col1, mode_col2 = st.columns(2)
     with mode_col1:
@@ -1855,6 +1910,7 @@ with tab7:
                     st.session_state["_last_tracker_serp"] = serp_resp
                     st.session_state["recovery_plan"]    = None  # reset stale plan from a prior keyword
                     st.session_state["improvement_plan"] = None
+                    st.session_state["llm_citation"]     = None
                     organic    = serp_resp.get("organic_results", [])
                     tracker    = serp_analyzer.query_position_tracker(tracking_url, organic)
                     features   = serp_analyzer.extract_serp_features(serp_resp)               if track_signals else None
@@ -2070,6 +2126,52 @@ with tab7:
             else:
                 st.info(f'ℹ️ Not found in the top {depth_used} results for this keyword.')
             st.markdown("</div>", unsafe_allow_html=True)
+
+        # ── LLM Citation Check — does Gemini itself cite you when grounded-answering? ──
+        # Distinct from AI Overview/PAA above: those read Google's own SERP data via
+        # SerpAPI. This asks Gemini the query directly with Google Search grounding on,
+        # and checks whether the target domain shows up in what Gemini actually cited.
+        if st.session_state.gemini_ok:
+            with st.container():
+                st.markdown('<div class="v7-card">', unsafe_allow_html=True)
+                slabel("🔮 LLM Citation Check (Gemini, grounded)")
+                st.markdown(
+                    '<div style="font-size:.78rem;opacity:.5;margin-bottom:10px;">'
+                    'A separate signal from AI Overview/PAA above — this asks Gemini the query directly '
+                    '(with live Google Search grounding on) and checks whether your domain shows up in what '
+                    'it actually cites. Reflects visibility in Gemini\'s own answers, not Google\'s SERP.</div>',
+                    unsafe_allow_html=True,
+                )
+                if st.button("Check Gemini Citation", key="llm_citation_btn"):
+                    with st.spinner("Asking Gemini directly, with search grounding on…"):
+                        lc = ai_seo.get_llm_citation_check(td["query"], td["target_url"], st.session_state.gemini_key)
+                        st.session_state["llm_citation"] = lc
+
+                _lc = st.session_state.get("llm_citation")
+                if _lc:
+                    if not _lc.get("ok"):
+                        st.warning(f"⚠️ Could not complete the check ({_lc.get('error', 'unknown error')}). Try again in a moment.")
+                    else:
+                        if _lc["cited"]:
+                            st.success(f"✅ Gemini cites your domain as source #{_lc['position']} of {_lc['total_citations']} in its grounded answer.")
+                        elif _lc["total_citations"]:
+                            st.warning(f"⚠️ Gemini answered this using {_lc['total_citations']} source(s), but your domain wasn't one of them.")
+                        else:
+                            st.info("ℹ️ Gemini answered without citing any external sources for this query.")
+                        if _lc.get("all_citations"):
+                            st.markdown("**Sources Gemini cited:**")
+                            for i, c in enumerate(_lc["all_citations"], start=1):
+                                _is_you = any(m["url"] == c["url"] for m in _lc.get("matches", []))
+                                st.markdown(
+                                    f'<div style="font-size:.82rem;padding:4px 0;'
+                                    f'{"font-weight:700;color:#4ade80;" if _is_you else "opacity:.7;"}">'
+                                    f'{i}. {"✓ " if _is_you else ""}{html_lib.escape(c.get("title","") or c.get("url",""))}</div>',
+                                    unsafe_allow_html=True,
+                                )
+                        if _lc.get("answer_excerpt"):
+                            with st.expander("View Gemini's grounded answer"):
+                                st.markdown(html_lib.escape(_lc["answer_excerpt"]))
+                st.markdown("</div>", unsafe_allow_html=True)
 
         # ── Improvement Plan — only surfaces when found, but not already #1 ────
         if track["found"] and track.get("position") and track["position"] > 1:

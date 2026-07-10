@@ -91,6 +91,76 @@ def call_gemini(
     return {"ok": True, "data": parsed}
 
 
+def call_gemini_grounded(api_key: str, prompt: str, model: str = DEFAULT_MODEL, temperature: float = 0.3) -> dict:
+    """
+    Calls Gemini with the `google_search` grounding tool enabled — the model runs
+    live Google searches itself and answers with citations to what it actually used.
+
+    This is NOT a SerpAPI replacement: it doesn't expose a ranked list of organic
+    results, PAA, or AI Overview data — it's a RAG-style grounded answer with
+    whatever sources the model chose to cite while responding. Useful for a distinct
+    signal: whether a domain gets cited when Gemini itself answers a query directly,
+    as opposed to what Google's own SERP/AI Overview shows.
+
+    Returns {"ok": True, "text": str, "citations": [{"title","url"}, ...]} or
+    {"ok": False, "error": str}. Deliberately skips responseSchema/JSON mode —
+    grounding + structured output don't combine reliably, so citations are read
+    straight from groundingMetadata instead of parsed model text.
+    """
+    if not api_key:
+        return {"ok": False, "error": "missing_api_key"}
+
+    url = GEMINI_ENDPOINT_TMPL.format(model=model)
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": 2048},
+    }
+
+    try:
+        r = requests.post(url, params={"key": api_key}, json=payload, timeout=TIMEOUT)
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"network_error: {e}"}
+
+    if r.status_code == 400:
+        return {"ok": False, "error": f"bad_request: {r.text[:200]}"}
+    if r.status_code in (401, 403):
+        return {"ok": False, "error": "invalid_api_key"}
+    if r.status_code == 429:
+        return {"ok": False, "error": "rate_limited"}
+    if r.status_code >= 500:
+        return {"ok": False, "error": f"gemini_server_error_{r.status_code}"}
+    try:
+        r.raise_for_status()
+        data = r.json()
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"http_error: {e}"}
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "invalid_response_json"}
+
+    candidates = data.get("candidates", [])
+    if not candidates:
+        block_reason = data.get("promptFeedback", {}).get("blockReason", "unknown")
+        return {"ok": False, "error": f"no_candidates_{block_reason}"}
+
+    cand = candidates[0]
+    parts = cand.get("content", {}).get("parts", [])
+    text = "".join(p.get("text", "") for p in parts if "text" in p)
+
+    citations = []
+    grounding_meta = cand.get("groundingMetadata", {}) or {}
+    for chunk in grounding_meta.get("groundingChunks", []) or []:
+        web = chunk.get("web", {}) or {}
+        if web.get("uri"):
+            citations.append({"title": web.get("title", ""), "url": web.get("uri", "")})
+
+    if not text and not citations:
+        finish_reason = cand.get("finishReason", "unknown")
+        return {"ok": False, "error": f"empty_response_{finish_reason}"}
+
+    return {"ok": True, "text": text, "citations": citations}
+
+
 def validate_gemini_key(api_key: str, model: str = DEFAULT_MODEL) -> dict:
     """Lightweight validation call — mirrors utils.validate_and_get_serpapi_quota()."""
     if not api_key:

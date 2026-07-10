@@ -14,7 +14,8 @@
 from __future__ import annotations
 import serp_analyzer
 import content_grader
-from gemini_client import call_gemini, DEFAULT_MODEL
+from gemini_client import call_gemini, call_gemini_grounded, DEFAULT_MODEL
+from utils import domain_of
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -769,4 +770,54 @@ effort estimate."""
         "citation_gap_recommendations": ["Run Citation Gap Scout for specific outreach leads."],
         "priority_actions": actions or ["Connect a Gemini API key, or inspect the target page, for specific recommendations."],
         "estimated_effort": "Moderate rewrite (days)",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  7. LLM CITATION CHECK — does Gemini itself cite you when grounded-answering?
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_llm_citation_check(query: str, target_url: str, api_key: str, model: str = DEFAULT_MODEL) -> dict:
+    """
+    Asks Gemini the query directly with Google Search grounding enabled, and checks
+    whether the target domain appears among the sources Gemini actually cited in its
+    grounded answer.
+
+    This is a DIFFERENT signal from check_ai_overview_presence() / check_paa_presence()
+    in serp_analyzer.py — those read Google's own SERP/AI Overview (via SerpAPI).
+    This one reflects visibility in Gemini's own grounded answers specifically — a
+    distinct, separate answer surface, not a replacement for real SERP position data.
+
+    Requires a Gemini API key — there's no formula fallback for this one, since
+    there's nothing to fall back to (it's not modeling anything SerpAPI already gives us).
+
+    Returns {"ok": bool, "cited": bool, "position": int|None, "matches": [...],
+             "total_citations": int, "all_citations": [...], "answer_excerpt": str, "error": str|None}
+    """
+    prompt = f"{query}\n\nAnswer directly and concisely based on current, real information."
+    result = call_gemini_grounded(api_key, prompt, model=model)
+
+    if not result["ok"]:
+        return {
+            "ok": False, "cited": False, "position": None, "matches": [],
+            "total_citations": 0, "all_citations": [], "answer_excerpt": "",
+            "error": result.get("error"),
+        }
+
+    target_domain = domain_of(target_url)
+    citations = result.get("citations", [])
+    matches = []
+    for idx, c in enumerate(citations, start=1):
+        if target_domain and target_domain == domain_of(c.get("url", "")):
+            matches.append({"position": idx, "title": c.get("title", ""), "url": c.get("url", "")})
+
+    return {
+        "ok": True,
+        "cited": len(matches) > 0,
+        "position": matches[0]["position"] if matches else None,
+        "matches": matches,
+        "total_citations": len(citations),
+        "all_citations": citations[:10],
+        "answer_excerpt": (result.get("text", "") or "")[:500],
+        "error": None,
     }
